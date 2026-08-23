@@ -185,4 +185,4 @@ print("Distances:\n", distances)
 ---
 
 ## 📄 License
-Apache License 2.0.(LICENSE) Developed by the FlashVector-GPU Core Team.
+Apache License 2.0 Developed by the FlashVector-GPU Core Team.
