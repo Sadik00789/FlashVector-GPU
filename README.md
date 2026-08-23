@@ -130,7 +130,7 @@ The distance lookup table $\text{LUT}[m][c]$ is stored in shared memory with a p
 
 ---
 
-## 🛠️ Quick Start & Installation (Fedora Linux)
+## 🛠️ Quick Start & Installation (Linux / WSL2)
 
 ### Prerequisites
 - NVIDIA Driver 550+ (`nvidia-smi`)
