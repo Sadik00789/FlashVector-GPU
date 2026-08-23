@@ -1,0 +1,72 @@
+# Rust build artifacts
+target/
+**/*.rs.bk
+Cargo.lock.bak
+
+# C++ / CUDA build artifacts
+kernels/build/
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.ninja
+.ninja_*
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+
+# Node / Next.js
+node_modules/
+.next/
+out/
+build/
+.pnpm-debug.log*
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-lock.yaml
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+.pytest_cache/
+
+# SIFT / Dataset binaries
+*.fvecs
+*.bvecs
+*.ivecs
+*.h5
+*.hdf5
+data/
+datasets/
+
+# IDE / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db

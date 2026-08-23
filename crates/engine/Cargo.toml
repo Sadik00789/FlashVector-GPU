@@ -1,0 +1,43 @@
+[package]
+name = "engine"
+version = "0.1.0"
+edition = "2021"
+authors = ["FlashVector-GPU Developers <dev@flashvector.ai>"]
+description = "Core Rust Host Orchestrator for FlashVector-GPU"
+license = "Apache-2.0"
+
+[dependencies]
+rayon = "1.10"
+parking_lot = "0.12"
+thiserror = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rand = "0.8"
+rand_distr = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+libc = "0.2"
+
+[dev-dependencies]
+criterion = "0.5"
+
+[build-dependencies]
+cc = "1.0"
+
+[[bench]]
+name = "bench_streams"
+path = "../../benches/bench_streams.rs"
+harness = false
+
+[[bench]]
+name = "bench_kmeans"
+path = "../../benches/bench_kmeans.rs"
+harness = false
+
+[[test]]
+name = "cuda_sanity_test"
+path = "../../tests/cuda_sanity_test.rs"
+
+[[test]]
+name = "e2e_search_test"
+path = "../../tests/e2e_search_test.rs"

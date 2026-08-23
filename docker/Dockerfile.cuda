@@ -1,0 +1,74 @@
+# Multi-stage build for FlashVector-GPU: CUDA 12.6 + Rust Toolchain + Node.js
+FROM nvidia/cuda:12.6.2-devel-ubuntu22.04 AS builder
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TZ=UTC
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    cmake \
+    ninja-build \
+    curl \
+    git \
+    pkg-config \
+    libssl-dev \
+    python3 \
+    python3-pip \
+    python3-dev \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Rust toolchain
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.80.0
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# Install Node.js & pnpm
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
+    apt-get install -y nodejs && \
+    npm install -g pnpm
+
+WORKDIR /workspace
+
+# Copy workspace files
+COPY Cargo.toml Cargo.lock Makefile ./
+COPY kernels ./kernels
+COPY crates ./crates
+COPY web ./web
+
+# Build CUDA kernels
+RUN cd kernels && mkdir -p build && cd build && \
+    cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES="86" .. && \
+    make -j$(nproc)
+
+# Build Rust server and engine
+RUN cargo build --workspace --release
+
+# Build Next.js frontend
+RUN cd web && pnpm install && pnpm build
+
+# Runtime Stage
+FROM nvidia/cuda:12.6.2-runtime-ubuntu22.04 AS runtime
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    libssl3 \
+    nodejs \
+    npm \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY --from=builder /workspace/target/release/server /app/server
+COPY --from=builder /workspace/web/.next/standalone /app/web/
+COPY --from=builder /workspace/web/.next/static /app/web/.next/static
+COPY --from=builder /workspace/web/public /app/web/public
+
+EXPOSE 8080 3000
+
+ENV RUST_LOG=info
+ENV PORT=3000
+ENV HOSTNAME="0.0.0.0"
+
+CMD ["sh", "-c", "/app/server & cd /app/web && node server.js"]

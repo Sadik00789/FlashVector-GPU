@@ -1,0 +1,43 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "gpu_vector_index"
+version = "0.1.0"
+description = "Ultra-fast GPU vector search engine with CUDA sm_86 kernels, HNSW beam search, and IVF-PQ ADC"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Apache-2.0" }
+authors = [
+    { name = "FlashVector-GPU Developers", email = "dev@flashvector.ai" }
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "numpy>=1.24.0",
+]
+
+[project.optional-dependencies]
+torch = [
+    "torch>=2.0.0",
+]
+
+[tool.maturin]
+manifest-path = "crates/python/Cargo.toml"
+module-name = "gpu_vector_index"
+features = ["pyo3/extension-module"]
+strip = true

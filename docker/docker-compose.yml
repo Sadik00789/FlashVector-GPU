@@ -1,0 +1,21 @@
+version: '3.8'
+
+services:
+  flashvector:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.cuda
+    ports:
+      - "8080:8080" # Axum HTTP / WebSocket gateway
+      - "3000:3000" # Next.js 3D Visualizer
+    environment:
+      - RUST_LOG=info
+      - CUDA_VISIBLE_DEVICES=0
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
