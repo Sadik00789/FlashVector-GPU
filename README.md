@@ -73,9 +73,11 @@ FlashVector-GPU is a ground-up GPU vector database and similarity search engine 
 
 ### 1. Warp-Level Vector Distance Reduction
 
-Given query vector $\mathbf{q} \in \mathbb{R}^D$ and candidate vector $\mathbf{x} \in \mathbb{R}^D$, 32 threads within an NVIDIA warp cooperatively reduce Euclidean squared distance with zero global memory barriers:
+Given query vector $`\mathbf{q} \in \mathbb{R}^D`$ and candidate vector $`\mathbf{x} \in \mathbb{R}^D`$, 32 threads within an NVIDIA warp cooperatively reduce Euclidean squared distance with zero global memory barriers:
 
-$$\mathcal{D}_{\text{L2}}^2(\mathbf{q}, \mathbf{x}) = \sum_{d=0}^{D-1} (q_d - x_d)^2 = \bigoplus_{i=0}^{31} \left( \sum_{k=0}^{\lfloor D/32 \rfloor - 1} (q_{32k + i} - x_{32k + i})^2 \right)$$
+$$
+\mathcal{D}_{\text{L2}}^2(\mathbf{q}, \mathbf{x}) = \sum_{d=0}^{D-1} (q_d - x_d)^2 = \bigoplus_{i=0}^{31} \left( \sum_{k=0}^{\lfloor D/32 \rfloor - 1} (q_{32k + i} - x_{32k + i})^2 \right)
+$$
 
 Using warp shuffle intrinsics (`__shfl_down_sync`):
 
@@ -111,11 +113,13 @@ __device__ __forceinline__ bool insert_visited(uint32_t* table, uint32_t node_id
 
 ### 3. Bank-Conflict-Free Shared Memory ADC Lookup (Stride 257)
 
-High-dimensional vectors are partitioned into $M$ orthogonal sub-vectors of dimension $d_{\text{sub}} = D / M$. For a query $\mathbf{q} = [\mathbf{q}_0, \dots, \mathbf{q}_{M-1}]$ and quantized codebook centroids $\mathcal{C}_m = \{ \mathbf{c}_{m,0}, \dots, \mathbf{c}_{m,255} \}$:
+High-dimensional vectors are partitioned into $`M`$ orthogonal sub-vectors of dimension $`d_{\text{sub}} = D / M`$. For a query $`\mathbf{q} = [\mathbf{q}_0, \dots, \mathbf{q}_{M-1}]`$ and quantized codebook centroids $`\mathcal{C}_m = \{ \mathbf{c}_{m,0}, \dots, \mathbf{c}_{m,255} \}`$:
 
-$$\mathcal{D}_{\text{ADC}}(\mathbf{q}, \mathbf{x}) = \sum_{m=0}^{M-1} \| \mathbf{q}_m - \mathbf{c}_{m, \mathbf{x}[m]} \|_2^2$$
+$$
+\mathcal{D}_{\text{ADC}}(\mathbf{q}, \mathbf{x}) = \sum_{m=0}^{M-1} \| \mathbf{q}_m - \mathbf{c}_{m, \mathbf{x}[m]} \|_2^2
+$$
 
-The distance lookup table $\text{LUT}[m][c]$ is stored in shared memory with a pitch of $\text{STRIDE} = 257$ floats (`smem_lut[m * 257 + code]`), ensuring that across all 32 warp lanes, no two threads access the same memory bank simultaneously.
+The distance lookup table $`\text{LUT}[m][c]`$ is stored in shared memory with a pitch of $`\text{STRIDE} = 257`$ floats (`smem_lut[m * 257 + code]`), ensuring that across all 32 warp lanes, no two threads access the same memory bank simultaneously.
 
 ---
 
