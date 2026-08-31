@@ -10,11 +10,11 @@
 FlashVector-GPU features an interactive 3D WebGL / Three.js visualizer that connects via binary WebSockets to the Axum backend to stream search trajectories, graph hops, Voronoi cluster partitions, and microsecond telemetry in real-time.
 
 ### 1. Warp-Cooperative HNSW Graph Beam Search
-![FlashVector-GPU HNSW Warp Beam Traversal](assets/visualizer_hnsw_beam.png)
+![FlashVector-GPU HNSW Warp Beam Traversal](assets/visualizer_ivf_pq.png)
 *Figure 1: Real-time HNSW beam search routing across 10,000 vectors with `efSearch = 112`, tracing animated 3D traversal rays from entry point to top-k nearest neighbors.*
 
 ### 2. IVF-PQ Dynamic Shared Memory ADC Lookup
-![FlashVector-GPU IVF-PQ ADC Search](assets/visualizer_ivf_pq.png)
+![FlashVector-GPU IVF-PQ ADC Search](assets/visualizer_hnsw_beam.png)
 *Figure 2: IVF-PQ Asymmetric Distance Computation (ADC) scanning probed Voronoi cluster centroids and decompressing quantized vector codes in dynamic shared memory.*
 
 ---
