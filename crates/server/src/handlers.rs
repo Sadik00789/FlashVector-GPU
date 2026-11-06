@@ -4,6 +4,7 @@ use axum::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         State,
     },
+    http::StatusCode,
     response::IntoResponse,
     Json,
 };
@@ -11,7 +12,9 @@ use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
-use engine::{gpu_get_memory, GpuSearchResult, LatencyStats, Vector3D};
+use engine::{
+    gpu_get_memory, GpuSearchResult, GpuVectorIndex, IndexConfig, LatencyStats, Vector3D,
+};
 use crate::state::AppState;
 
 #[derive(Debug, Deserialize)]
@@ -63,6 +66,20 @@ pub struct Vectors3DResponse {
     pub points: Vec<Vector3D>,
     pub clusters: Vec<u32>,
     pub count: usize,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SnapshotRequest {
+    pub vectors: Vec<f32>,
+    pub dim: usize,
+    pub metadata: Option<Vec<serde_json::Value>>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PqDistortionResponse {
+    pub cluster_id: usize,
+    pub avg_reconstruction_error: f32,
+    pub vector_count: usize,
 }
 
 pub async fn handle_stats(State(state): State<AppState>) -> Json<IndexStatsResponse> {
@@ -122,6 +139,138 @@ pub async fn handle_index(
         "status": "success",
         "message": format!("Index built successfully with {} vectors", num_vectors)
     }))
+}
+
+/// Pick the largest PQ partition count that evenly divides the snapshot dimension.
+fn choose_m_pq(dim: usize) -> u32 {
+    for candidate in [16u32, 8, 4, 2, 1] {
+        if dim % candidate as usize == 0 {
+            return candidate;
+        }
+    }
+    1
+}
+
+/// Load an arbitrary externally generated embedding snapshot and replace the
+/// live index, 3D projection, and dataset cache.
+pub async fn handle_load_snapshot(
+    State(state): State<AppState>,
+    Json(payload): Json<SnapshotRequest>,
+) -> impl IntoResponse {
+    let dim = payload.dim;
+    if dim == 0 || payload.vectors.is_empty() || payload.vectors.len() % dim != 0 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "status": "error",
+                "message": "dim must be non-zero and vectors.len() must be a positive multiple of dim"
+            })),
+        );
+    }
+
+    let num_vectors = payload.vectors.len() / dim;
+    if num_vectors > u32::MAX as usize {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "status": "error",
+                "message": "snapshot exceeds the maximum supported vector count"
+            })),
+        );
+    }
+
+    let config = IndexConfig {
+        dim: dim as u32,
+        max_elements: num_vectors as u32,
+        m: 32,
+        ef_construction: 128,
+        nlist: num_vectors.min(32) as u32,
+        m_pq: choose_m_pq(dim),
+        nbits_pq: 8,
+        metric: 0,
+    };
+
+    let mut index = match GpuVectorIndex::new(config) {
+        Ok(index) => index,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "status": "error",
+                    "message": format!("Failed to allocate GPU index: {:?}", e)
+                })),
+            );
+        }
+    };
+
+    if let Err(e) = index.build(&payload.vectors) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "status": "error",
+                "message": format!("Failed to build index from snapshot: {:?}", e)
+            })),
+        );
+    }
+
+    let projector = crate::projection::PcaProjector3D::fit(&payload.vectors, dim, 2000);
+    let points_3d = projector.project_batch(&payload.vectors);
+
+    let cluster_ids = payload
+        .metadata
+        .as_ref()
+        .filter(|metadata| metadata.len() == num_vectors)
+        .map(|metadata| {
+            metadata
+                .iter()
+                .map(|entry| {
+                    entry
+                        .get("cluster")
+                        .and_then(|value| value.as_u64())
+                        .map(|value| value.min(u32::MAX as u64) as u32)
+                        .unwrap_or(0)
+                })
+                .collect::<Vec<u32>>()
+        })
+        .unwrap_or_default();
+
+    *state.index.write() = index;
+    *state.projector.write() = Some(projector);
+    *state.projected_points_3d.write() = points_3d;
+    *state.cluster_ids.write() = cluster_ids;
+    *state.dataset_cache.write() = payload.vectors;
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "success",
+            "message": format!(
+                "Snapshot loaded and indexed successfully ({} vectors, dim {})",
+                num_vectors, dim
+            )
+        })),
+    )
+}
+
+/// Per-cluster PQ reconstruction error for the Studio distortion heatmap.
+pub async fn handle_pq_distortion(
+    State(state): State<AppState>,
+) -> Json<Vec<PqDistortionResponse>> {
+    let clusters = {
+        let index = state.index.read();
+        index.pq_distortion(1_000)
+    };
+
+    Json(
+        clusters
+            .into_iter()
+            .map(|cluster| PqDistortionResponse {
+                cluster_id: cluster.cluster_id,
+                avg_reconstruction_error: cluster.avg_reconstruction_error,
+                vector_count: cluster.vector_count,
+            })
+            .collect(),
+    )
 }
 
 pub async fn handle_search(

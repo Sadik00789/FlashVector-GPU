@@ -1,12 +1,12 @@
 'use client';
 
-import { useMemo, useRef, useEffect } from 'react';
+import { useRef, useEffect } from 'react';
 import { Canvas } from '@react-three/fiber';
 import { OrbitControls, Stars } from '@react-three/drei';
 import * as THREE from 'three';
 
 import { GpuSearchResult, TraversalHop3D, Vector3D } from '../../lib/types';
-import { getClusterColor, hexToRgb } from '../../lib/math';
+import { getClusterColor } from '../../lib/math';
 import CentroidNodes from './CentroidNodes';
 import TraversalBeam from './TraversalBeam';
 
@@ -15,56 +15,47 @@ interface EmbeddingSpaceProps {
   clusters: number[];
   hops: TraversalHop3D[];
   results: GpuSearchResult[];
+  currentHop: number;
 }
 
 function VectorPointCloud({ points, clusters }: { points: Vector3D[]; clusters: number[] }) {
-  const pointsRef = useRef<THREE.Points>(null);
+  const meshRef = useRef<THREE.InstancedMesh>(null);
 
-  const geometry = useMemo(() => {
-    if (!points || points.length === 0) return null;
+  useEffect(() => {
+    const mesh = meshRef.current;
+    if (!mesh || points.length === 0) return;
 
-    const positions = new Float32Array(points.length * 3);
-    const colors = new Float32Array(points.length * 3);
+    const dummy = new THREE.Object3D();
+    const color = new THREE.Color();
 
-    points.forEach((p, i) => {
-      positions[i * 3 + 0] = p.x;
-      positions[i * 3 + 1] = p.y;
-      positions[i * 3 + 2] = p.z;
+    for (let i = 0; i < points.length; i++) {
+      const p = points[i];
+      dummy.position.set(p.x, p.y, p.z);
+      dummy.updateMatrix();
+      mesh.setMatrixAt(i, dummy.matrix);
 
-      const cluster = clusters[i] ?? 0;
-      const hex = getClusterColor(cluster);
-      const [r, g, b] = hexToRgb(hex);
+      color.set(getClusterColor(clusters[i] ?? 0));
+      mesh.setColorAt(i, color);
+    }
 
-      colors[i * 3 + 0] = r;
-      colors[i * 3 + 1] = g;
-      colors[i * 3 + 2] = b;
-    });
-
-    const geom = new THREE.BufferGeometry();
-    geom.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-    geom.setAttribute('color', new THREE.BufferAttribute(colors, 3));
-    return geom;
+    mesh.instanceMatrix.needsUpdate = true;
+    if (mesh.instanceColor) {
+      mesh.instanceColor.needsUpdate = true;
+    }
   }, [points, clusters]);
 
-  // Clean up geometry to prevent WebGL context leaks
-  useEffect(() => {
-    return () => {
-      if (geometry) geometry.dispose();
-    };
-  }, [geometry]);
-
-  if (!geometry) return null;
+  if (points.length === 0) return null;
 
   return (
-    <points ref={pointsRef} geometry={geometry}>
-      <pointsMaterial
-        size={0.65}
-        vertexColors
-        transparent
-        opacity={0.7}
-        sizeAttenuation
-      />
-    </points>
+    <instancedMesh
+      key={points.length}
+      ref={meshRef}
+      args={[undefined, undefined, points.length]}
+      frustumCulled={false}
+    >
+      <sphereGeometry args={[0.3, 8, 8]} />
+      <meshBasicMaterial toneMapped={false} />
+    </instancedMesh>
   );
 }
 
@@ -73,6 +64,7 @@ export default function EmbeddingSpace({
   clusters,
   hops,
   results,
+  currentHop,
 }: EmbeddingSpaceProps) {
   return (
     <div className="w-full h-full relative">
@@ -90,14 +82,19 @@ export default function EmbeddingSpace({
         {/* Ambient starfield background */}
         <Stars radius={150} depth={50} count={3000} factor={4} saturation={1} fade speed={1} />
 
-        {/* Vector Point Cloud */}
+        {/* Vector Point Cloud (single instanced draw call) */}
         <VectorPointCloud points={points} clusters={clusters} />
 
         {/* Voronoi / IVF Centroid Nodes */}
         <CentroidNodes points={points} clusters={clusters} />
 
         {/* Traversal Beam Routing & Top-K Targets */}
-        <TraversalBeam hops={hops} results={results} points={points} />
+        <TraversalBeam
+          hops={hops}
+          results={results}
+          points={points}
+          currentHop={currentHop}
+        />
 
         <OrbitControls
           enableDamping

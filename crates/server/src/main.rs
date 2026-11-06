@@ -11,7 +11,10 @@ mod handlers;
 mod projection;
 mod state;
 
-use handlers::{handle_get_3d_vectors, handle_index, handle_search, handle_stats, handle_ws_stream};
+use handlers::{
+    handle_get_3d_vectors, handle_index, handle_load_snapshot, handle_pq_distortion,
+    handle_search, handle_stats, handle_ws_stream,
+};
 use state::AppState;
 
 #[tokio::main]
@@ -40,6 +43,8 @@ async fn main() {
     let app = Router::new()
         .route("/api/v1/search", post(handle_search))
         .route("/api/v1/index", post(handle_index))
+        .route("/api/v1/snapshot", post(handle_load_snapshot))
+        .route("/api/v1/pq_distortion", get(handle_pq_distortion))
         .route("/api/v1/stats", get(handle_stats))
         .route("/api/v1/vectors/3d", get(handle_get_3d_vectors))
         .route("/ws/stream", get(handle_ws_stream))

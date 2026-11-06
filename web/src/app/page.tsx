@@ -2,7 +2,7 @@
 
 import React, { useState, useEffect, useCallback } from 'react';
 import dynamic from 'next/dynamic';
-import { Cpu, Terminal, Layers, Sparkles, Activity, Search } from 'lucide-react';
+import { Cpu, Layers, Activity, Search, Play, Pause } from 'lucide-react';
 
 import ControlPanel from '../components/ui/ControlPanel';
 import MetricsPanel from '../components/ui/MetricsPanel';
@@ -10,6 +10,8 @@ import ComparisonPlot from '../components/ui/ComparisonPlot';
 import { useWebSocket } from '../hooks/useWebSocket';
 import { IndexStats, QueryParams, Vector3D, Vectors3DResponse } from '../lib/types';
 import { formatLatency } from '../lib/math';
+
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8080';
 
 // Dynamically import 3D Canvas to avoid SSR hydration mismatches
 const EmbeddingSpace = dynamic(
@@ -23,6 +25,9 @@ export default function Dashboard() {
   const [stats, setStats] = useState<IndexStats | null>(null);
   const [isRebuilding, setIsRebuilding] = useState(false);
 
+  const [currentHop, setCurrentHop] = useState(0);
+  const [isPlaying, setIsPlaying] = useState(false);
+
   const [queryParams, setQueryParams] = useState<QueryParams>({
     top_k: 10,
     ef_search: 64,
@@ -32,12 +37,14 @@ export default function Dashboard() {
 
   const { isConnected, latestResponse, latencyHistory, sendQuery } = useWebSocket();
 
+  const hopCount = latestResponse?.hops?.length ?? 0;
+
   // Fetch initial 3D dataset and stats
   const loadData = useCallback(async () => {
     try {
       const [vecRes, statsRes] = await Promise.all([
-        fetch('http://localhost:8080/api/v1/vectors/3d'),
-        fetch('http://localhost:8080/api/v1/stats'),
+        fetch(`${API_BASE}/api/v1/vectors/3d`),
+        fetch(`${API_BASE}/api/v1/stats`),
       ]);
 
       if (vecRes.ok) {
@@ -61,6 +68,30 @@ export default function Dashboard() {
     return () => clearInterval(interval);
   }, [loadData]);
 
+  // Restart the replay scrubber whenever a new traversal arrives
+  useEffect(() => {
+    setCurrentHop(0);
+    setIsPlaying(false);
+  }, [latestResponse]);
+
+  // Keep the cursor in range when the traversal length changes
+  useEffect(() => {
+    setCurrentHop((hop) => Math.min(hop, hopCount));
+  }, [hopCount]);
+
+  // Hop-by-hop playback
+  useEffect(() => {
+    if (!isPlaying) return;
+    if (hopCount === 0 || currentHop >= hopCount) {
+      setIsPlaying(false);
+      return;
+    }
+    const timer = setTimeout(() => {
+      setCurrentHop((hop) => Math.min(hop + 1, hopCount));
+    }, 180);
+    return () => clearTimeout(timer);
+  }, [isPlaying, currentHop, hopCount]);
+
   const handleTriggerSearch = () => {
     sendQuery(queryParams);
   };
@@ -68,7 +99,7 @@ export default function Dashboard() {
   const handleRebuildDataset = async (numVectors: number) => {
     setIsRebuilding(true);
     try {
-      await fetch('http://localhost:8080/api/v1/index', {
+      await fetch(`${API_BASE}/api/v1/index`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ num_vectors: numVectors, dim: 128, num_clusters: 16 }),
@@ -136,7 +167,45 @@ export default function Dashboard() {
             clusters={clusters}
             hops={latestResponse?.hops ?? []}
             results={latestResponse?.results ?? []}
+            currentHop={currentHop}
           />
+
+          {/* Traversal Replay Scrubber */}
+          <div className="absolute bottom-6 left-1/2 -translate-x-1/2 z-20">
+            <div className="glass-panel-glow px-6 py-3 rounded-2xl flex items-center gap-4">
+              <button
+                onClick={() => {
+                  if (!isPlaying && currentHop >= hopCount) {
+                    setCurrentHop(0);
+                  }
+                  setIsPlaying((playing) => !playing);
+                }}
+                disabled={hopCount === 0}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-primary/20 text-primary hover:bg-primary/30 text-xs font-mono font-semibold disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+              >
+                {isPlaying ? <Pause className="w-3.5 h-3.5" /> : <Play className="w-3.5 h-3.5" />}
+                {isPlaying ? 'Pause' : 'Play'}
+              </button>
+              <input
+                type="range"
+                min={0}
+                max={hopCount}
+                value={currentHop}
+                disabled={hopCount === 0}
+                onChange={(e) => {
+                  setIsPlaying(false);
+                  setCurrentHop(parseInt(e.target.value, 10));
+                }}
+                className="w-64 accent-primary disabled:opacity-40"
+              />
+              <span className="font-mono text-xs text-primary whitespace-nowrap">
+                Hop {currentHop} / {hopCount}
+              </span>
+              <span className="font-mono text-xs text-slate-400 whitespace-nowrap">
+                {formatLatency(latestResponse?.latency_us ?? 0)}
+              </span>
+            </div>
+          </div>
         </div>
 
         {/* Right Telemetry Column */}

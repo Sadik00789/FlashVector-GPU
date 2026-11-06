@@ -9,20 +9,32 @@ interface TraversalBeamProps {
   hops: TraversalHop3D[];
   results: GpuSearchResult[];
   points: Vector3D[];
+  currentHop: number;
 }
 
-export default function TraversalBeam({ hops, results, points }: TraversalBeamProps) {
+export default function TraversalBeam({
+  hops,
+  results,
+  points,
+  currentHop,
+}: TraversalBeamProps) {
   const lineRef = useRef<THREE.LineSegments>(null);
   const pulseGroupRef = useRef<THREE.Group>(null);
 
-  // Build line geometry from hops
+  // Reveal hops progressively as the replay scrubber advances
+  const visibleHops = useMemo(() => {
+    if (!hops || hops.length === 0) return [];
+    return hops.slice(0, currentHop + 1);
+  }, [hops, currentHop]);
+
+  // Build line geometry from the visible hops
   const lineGeometry = useMemo(() => {
-    if (!hops || hops.length === 0) return null;
+    if (visibleHops.length === 0) return null;
 
-    const positions = new Float32Array(hops.length * 6);
-    const colors = new Float32Array(hops.length * 6);
+    const positions = new Float32Array(visibleHops.length * 6);
+    const colors = new Float32Array(visibleHops.length * 6);
 
-    hops.forEach((hop, idx) => {
+    visibleHops.forEach((hop, idx) => {
       const p1 = hop.from_pos;
       const p2 = hop.to_pos;
 
@@ -36,7 +48,8 @@ export default function TraversalBeam({ hops, results, points }: TraversalBeamPr
       positions[idx * 6 + 4] = p2.y;
       positions[idx * 6 + 5] = p2.z;
 
-      // Color gradient from electric blue to bright hot pink
+      // Color gradient from electric blue to bright hot pink. Use the full
+      // traversal length so colors stay stable while scrubbing.
       const t = idx / Math.max(1, hops.length - 1);
       const r = 0.0 + t * 1.0;
       const g = 0.9 - t * 0.7;
@@ -55,7 +68,7 @@ export default function TraversalBeam({ hops, results, points }: TraversalBeamPr
     geom.setAttribute('position', new THREE.BufferAttribute(positions, 3));
     geom.setAttribute('color', new THREE.BufferAttribute(colors, 3));
     return geom;
-  }, [hops]);
+  }, [visibleHops, hops.length]);
 
   // Clean up geometry to prevent memory leaks
   useEffect(() => {
@@ -96,8 +109,8 @@ export default function TraversalBeam({ hops, results, points }: TraversalBeamPr
       )}
 
       {/* Glowing Entry Node Marker */}
-      {hops.length > 0 && hops[0]?.from_pos && (
-        <mesh position={[hops[0].from_pos.x, hops[0].from_pos.y, hops[0].from_pos.z]}>
+      {visibleHops.length > 0 && visibleHops[0]?.from_pos && (
+        <mesh position={[visibleHops[0].from_pos.x, visibleHops[0].from_pos.y, visibleHops[0].from_pos.z]}>
           <sphereGeometry args={[1.5, 16, 16]} />
           <meshStandardMaterial
             color="#ff0055"

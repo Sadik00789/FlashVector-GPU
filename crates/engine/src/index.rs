@@ -34,6 +34,15 @@ fn normalize_slice_in_place(values: &mut [f32], dim: usize) {
     }
 }
 
+/// Per-Voronoi-cell PQ reconstruction statistics used by the Studio heatmap.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ClusterPqDistortion {
+    pub cluster_id: usize,
+    /// Mean squared reconstruction error normalized by the original vector norm.
+    pub avg_reconstruction_error: f32,
+    pub vector_count: usize,
+}
+
 pub struct GpuVectorIndex {
     config: IndexConfig,
     metrics: Arc<MetricsTracker>,
@@ -762,4 +771,74 @@ impl GpuVectorIndex {
         self.config
     }
 
+    /// Compute per-cluster PQ reconstruction error from the trained codebooks.
+    ///
+    /// Each vector is rebuilt from its `m_pq` codebook centroids and compared
+    /// against the stored representation. The reported error is the mean of
+    /// `||x - x_hat||^2 / ||x||^2`, sampled evenly across each inverted list.
+    pub fn pq_distortion(&self, max_samples_per_cluster: usize) -> Vec<ClusterPqDistortion> {
+        if !self.is_built || self.num_vectors == 0 {
+            return Vec::new();
+        }
+
+        let dim = self.config.dim as usize;
+        let m_pq = self.config.m_pq as usize;
+        let sub_dim = dim / m_pq;
+        let nlist = self.h_centroids.len() / dim;
+        let sample_limit = max_samples_per_cluster.max(1);
+
+        let vectors = self.raw_vectors.as_slice();
+        let codebooks = self.h_codebooks.as_slice();
+        let codes = self.h_codes.as_slice();
+        let offsets = self.h_ivf_offsets.as_slice();
+        let vec_ids = self.h_ivf_vec_ids.as_slice();
+
+        (0..nlist)
+            .map(|cluster_id| {
+                let start = offsets[cluster_id] as usize;
+                let end = offsets[cluster_id + 1] as usize;
+                let vector_count = end - start;
+
+                if vector_count == 0 {
+                    return ClusterPqDistortion {
+                        cluster_id,
+                        avg_reconstruction_error: 0.0,
+                        vector_count: 0,
+                    };
+                }
+
+                let stride = ((vector_count + sample_limit - 1) / sample_limit).max(1);
+                let mut error_sum = 0.0f64;
+                let mut sampled = 0usize;
+
+                let mut pos = start;
+                while pos < end {
+                    let vec_id = vec_ids[pos] as usize;
+                    let vector = &vectors[vec_id * dim..(vec_id + 1) * dim];
+                    let norm_sq: f32 = vector.iter().map(|x| x * x).sum();
+
+                    let mut reconstruction_error = 0.0f32;
+                    for m in 0..m_pq {
+                        let code = codes[vec_id * m_pq + m] as usize;
+                        let centroid_offset = (m * 256 + code) * sub_dim;
+                        let centroid = &codebooks[centroid_offset..centroid_offset + sub_dim];
+                        for d in 0..sub_dim {
+                            let diff = vector[m * sub_dim + d] - centroid[d];
+                            reconstruction_error += diff * diff;
+                        }
+                    }
+
+                    error_sum += (reconstruction_error / norm_sq.max(1e-12)) as f64;
+                    sampled += 1;
+                    pos += stride;
+                }
+
+                ClusterPqDistortion {
+                    cluster_id,
+                    avg_reconstruction_error: (error_sum / sampled as f64) as f32,
+                    vector_count,
+                }
+            })
+            .collect()
+    }
 }

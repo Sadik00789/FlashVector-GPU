@@ -13,7 +13,7 @@ pub use memory::{DeviceBuffer, PinnedBuffer};
 pub use streams::{CudaStream, CudaStreamPool};
 pub use cluster::{KMeans, KMeansResult, ProductQuantizer};
 pub use metrics::{LatencyStats, MetricsTracker, RecallEvaluator};
-pub use index::GpuVectorIndex;
+pub use index::{ClusterPqDistortion, GpuVectorIndex};
 
 /// Initialize GPU runtime and context for the current process
 pub fn init_gpu(device_id: i32) -> Result<(), CudaError> {
