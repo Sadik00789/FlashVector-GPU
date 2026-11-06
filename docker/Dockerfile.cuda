@@ -1,6 +1,8 @@
 # Multi-stage build for FlashVector-GPU: CUDA 12.6 + Rust Toolchain + Node.js
 FROM nvidia/cuda:12.6.2-devel-ubuntu22.04 AS builder
 
+ARG CUDA_ARCH_LIST="75;80;86;89;90"
+
 ENV DEBIAN_FRONTEND=noninteractive
 ENV TZ=UTC
 
@@ -35,9 +37,9 @@ COPY kernels ./kernels
 COPY crates ./crates
 COPY web ./web
 
-# Build CUDA kernels
+# Build multi-arch CUDA kernels (sm_75 / sm_80 / sm_86 / sm_89 / sm_90 + compute_90 PTX)
 RUN cd kernels && mkdir -p build && cd build && \
-    cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES="86" .. && \
+    cmake -DCMAKE_BUILD_TYPE=Release -DCUDA_ARCH_LIST="${CUDA_ARCH_LIST}" .. && \
     make -j$(nproc)
 
 # Build Rust server and engine

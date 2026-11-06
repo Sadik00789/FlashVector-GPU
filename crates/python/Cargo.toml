@@ -8,7 +8,7 @@ license = "Apache-2.0"
 
 [lib]
 name = "gpu_vector_index"
-crate-type = ["cdylib", "rlib"]
+crate-type = ["cdylib"]
 
 [dependencies]
 engine = { path = "../engine" }

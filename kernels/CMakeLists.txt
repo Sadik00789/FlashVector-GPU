@@ -22,8 +22,15 @@ if(FLASHVECTOR_TRACE)
     add_compile_definitions(FLASHVECTOR_TRACE_MODE=1)
 endif()
 
-set(CUDA_ARCH "86" CACHE STRING "CUDA GPU Architecture (e.g. 86)")
-set(NVCC_GENCODE "-gencode=arch=compute_${CUDA_ARCH},code=sm_${CUDA_ARCH}")
+# Build a fat binary spanning Turing through Hopper, plus a compute_90 PTX
+# fallback so future architectures (sm_100+) can JIT from the same archive.
+set(CUDA_ARCH_LIST "75;80;86;89;90" CACHE STRING "CUDA architectures to build (semicolon-separated)")
+
+set(NVCC_GENCODES "")
+foreach(ARCH ${CUDA_ARCH_LIST})
+    list(APPEND NVCC_GENCODES "-gencode=arch=compute_${ARCH},code=sm_${ARCH}")
+endforeach()
+list(APPEND NVCC_GENCODES "-gencode=arch=compute_90,code=compute_90")
 
 set(KERNEL_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src")
 set(KERNEL_INC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/include")
@@ -50,24 +57,24 @@ set(OBJ_FILES
 # Compile the CUDA translation units with nvcc (native CUDA compiler driver).
 add_custom_command(
     OUTPUT "${BUILD_DIR}/hnsw_traverse.${OBJ_EXT}"
-    COMMAND ${CUDA_NVCC} -x cu ${NVCC_GENCODE} -O3 --use_fast_math -std=c++17
+    COMMAND ${CUDA_NVCC} -x cu ${NVCC_GENCODES} -O3 --use_fast_math -std=c++17
         -I${KERNEL_INC_DIR} -I${CUDA_TOOLKIT_ROOT_DIR}/include ${NVCC_HOST_FLAGS} ${TRACE_DEFINE}
         -c "${KERNEL_SRC_DIR}/hnsw_traverse.cu" -o "${BUILD_DIR}/hnsw_traverse.${OBJ_EXT}"
     DEPENDS "${KERNEL_SRC_DIR}/hnsw_traverse.cu" "${KERNEL_SRC_DIR}/hnsw_traverse.cuh"
             "${KERNEL_SRC_DIR}/distance_metrics.cuh" "${KERNEL_SRC_DIR}/bitonic_topk.cuh"
             "${KERNEL_INC_DIR}/types.h" "${KERNEL_INC_DIR}/cuda_bridge.h"
-    COMMENT "Compiling hnsw_traverse.cu (sm_${CUDA_ARCH})"
+    COMMENT "Compiling hnsw_traverse.cu (arch ${CUDA_ARCH_LIST}, multi-arch fatbin)"
 )
 
 add_custom_command(
     OUTPUT "${BUILD_DIR}/ivf_pq_lookup.${OBJ_EXT}"
-    COMMAND ${CUDA_NVCC} -x cu ${NVCC_GENCODE} -O3 --use_fast_math -std=c++17
+    COMMAND ${CUDA_NVCC} -x cu ${NVCC_GENCODES} -O3 --use_fast_math -std=c++17
         -I${KERNEL_INC_DIR} -I${CUDA_TOOLKIT_ROOT_DIR}/include ${NVCC_HOST_FLAGS} ${TRACE_DEFINE}
         -c "${KERNEL_SRC_DIR}/ivf_pq_lookup.cu" -o "${BUILD_DIR}/ivf_pq_lookup.${OBJ_EXT}"
     DEPENDS "${KERNEL_SRC_DIR}/ivf_pq_lookup.cu" "${KERNEL_SRC_DIR}/ivf_pq_lookup.cuh"
             "${KERNEL_SRC_DIR}/distance_metrics.cuh" "${KERNEL_SRC_DIR}/bitonic_topk.cuh"
             "${KERNEL_INC_DIR}/types.h" "${KERNEL_INC_DIR}/cuda_bridge.h"
-    COMMENT "Compiling ivf_pq_lookup.cu (sm_${CUDA_ARCH})"
+    COMMENT "Compiling ivf_pq_lookup.cu (arch ${CUDA_ARCH_LIST}, multi-arch fatbin)"
 )
 
 if(WIN32)
@@ -76,7 +83,7 @@ if(WIN32)
         OUTPUT "${KERNEL_LIB}"
         COMMAND ${CMAKE_AR} /NOLOGO /OUT:"${KERNEL_LIB}" ${OBJ_FILES}
         DEPENDS ${OBJ_FILES}
-        COMMENT "Archiving gpukernels.lib"
+        COMMENT "Archiving multi-arch gpukernels.lib"
     )
 else()
     set(KERNEL_LIB "${BUILD_DIR}/libgpukernels.a")
@@ -84,7 +91,7 @@ else()
         OUTPUT "${KERNEL_LIB}"
         COMMAND ${CMAKE_AR} rcs "${KERNEL_LIB}" ${OBJ_FILES}
         DEPENDS ${OBJ_FILES}
-        COMMENT "Archiving libgpukernels.a"
+        COMMENT "Archiving multi-arch libgpukernels.a"
     )
 endif()
 

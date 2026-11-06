@@ -1,0 +1,14 @@
+# Build artifacts and caches must never enter the Docker build context
+.git
+.gitignore
+.commandcode
+.pytest_cache
+target
+kernels/build
+web/node_modules
+web/.next
+web/out
+**/__pycache__
+**/*.py[cod]
+*.nsys-rep
+*.sqlite

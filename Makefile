@@ -26,7 +26,7 @@ help:
 	@echo "make clean         - Clean build artifacts"
 
 build-kernels:
-	@echo "==> Building CUDA Kernels (sm_86)..."
+	@echo "==> Building multi-arch CUDA Kernels (sm_75/80/86/89/90)..."
 	mkdir -p kernels/build
 	cd kernels/build && cmake -DCMAKE_BUILD_TYPE=Release .. && cmake --build . -j$$(nproc)
 
