@@ -115,5 +115,24 @@ def test_large_top_k():
     assert valid >= top_k * 0.9, f"Only {valid}/{top_k} valid results"
 
 
+@pytest.mark.skipif(not HAS_BINDINGS, reason="gpu_vector_index not built")
+def test_large_top_k_ivf():
+    """Regression: block merge must not drop IVF-PQ candidates for top_k > 32."""
+    dim = 64
+    num_vectors = 1000
+    top_k = 100
+    data = np.random.randn(num_vectors, dim).astype(np.float32)
+    query = np.random.randn(1, dim).astype(np.float32)
+    index = gpu_vector_index.FlashVectorGPU(
+        dim=dim, max_elements=num_vectors, m=16, nlist=16, m_pq=8
+    )
+    index.build(data)
+    labels, dists = index.search_ivf(query, top_k=top_k, nprobe=16)
+    assert labels.shape == (1, top_k)
+    valid = np.sum(labels[0] != 0xFFFFFFFF)
+    assert valid >= top_k * 0.9, f"Only {valid}/{top_k} valid IVF results"
+    assert np.all(dists[0][:-1] <= dists[0][1:]), "IVF distances must be sorted"
+
+
 if __name__ == "__main__":
     pytest.main(["-v", __file__])

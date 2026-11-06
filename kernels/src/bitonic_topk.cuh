@@ -130,8 +130,10 @@ struct CandidateList {
     }
 };
 
-// Block-wide parallel top-k merger across all threads in a thread block
-template <int MAX_K = 64>
+// Block-wide parallel top-k merger across all threads in a thread block.
+// Each thread submits every candidate it holds (not just its best one), so no
+// local top-k entry is lost during the block reduction.
+template <int MAX_K = 32>
 __device__ __inline__ void block_bitonic_merge_topk(
     const CandidateList<MAX_K>& local_list,
     GpuSearchResult* smem_merged,
@@ -148,8 +150,7 @@ __device__ __inline__ void block_bitonic_merge_topk(
     }
     __syncthreads();
 
-    // 2. Sequential/Reduction merge into shared memory top-k list
-    // Each thread tries to insert its candidates into the shared memory top-k
+    // 2. Serialize across threads, but insert ALL local candidates per thread
     for (int t = 0; t < block_size; ++t) {
         if (tid == t) {
             for (int k = 0; k < local_list.size; ++k) {
@@ -157,7 +158,6 @@ __device__ __inline__ void block_bitonic_merge_topk(
                 float dist = local_list.distances[k];
 
                 if (dist < smem_merged[top_k - 1].distance) {
-                    // Check duplicate
                     bool duplicate = false;
                     int insert_pos = -1;
 

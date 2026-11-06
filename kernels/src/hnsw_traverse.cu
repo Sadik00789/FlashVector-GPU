@@ -6,7 +6,31 @@ namespace flashvector {
 #define WARPS_PER_BLOCK 4
 #define THREADS_PER_BLOCK (WARPS_PER_BLOCK * WARP_SIZE)
 
-// Warp-cooperative HNSW beam-search graph traversal kernel
+// Trace instrumentation is compiled into a dedicated kernel variant so the
+// default search path pays no branch or shared-memory-atomic overhead.
+#ifdef FLASHVECTOR_TRACE_MODE
+#define FLASHVECTOR_TRACE_ENABLED 1
+#else
+#define FLASHVECTOR_TRACE_ENABLED 0
+#endif
+
+#define TRACE_LOG(hop_ptr, hop_count, warp_idx, query_idx_, max_hops, from_node_, to_node_, dist_) \
+    do { \
+        if ((hop_ptr) != nullptr && (hop_count) != nullptr) { \
+            uint32_t _trace_idx = atomicAdd(&(hop_count)[warp_idx], 1u); \
+            if (_trace_idx < (max_hops)) { \
+                uint32_t _trace_pos = (query_idx_) * (max_hops) + _trace_idx; \
+                (hop_ptr)[_trace_pos].step = _trace_idx; \
+                (hop_ptr)[_trace_pos].from_node = (from_node_); \
+                (hop_ptr)[_trace_pos].to_node = (to_node_); \
+                (hop_ptr)[_trace_pos].distance = (dist_); \
+            } \
+        } \
+    } while (0)
+
+// Warp-cooperative HNSW beam-search graph traversal kernel.
+// ENABLE_TRACE selects the telemetry-recording variant at compile time.
+template <bool ENABLE_TRACE>
 __global__ void hnsw_warp_traverse_kernel(
     const float* __restrict__ d_vectors,
     const uint32_t* __restrict__ d_adjacency,
@@ -42,14 +66,17 @@ __global__ void hnsw_warp_traverse_kernel(
     CandidateList<MAX_BEAM_WIDTH>& candidates = s_candidates[warp_in_block];
     uint32_t* visited_table = s_visited_hash[warp_in_block];
 
-    uint32_t clamped_ef = (ef_search > MAX_BEAM_WIDTH) ? MAX_BEAM_WIDTH : ef_search;
+    uint32_t clamped_ef = ef_search;
+    if (clamped_ef < top_k) clamped_ef = top_k;
+    if (clamped_ef > MAX_BEAM_WIDTH) clamped_ef = MAX_BEAM_WIDTH;
+    if (clamped_ef == 0) clamped_ef = 1;
 
     // Initialize visited hash table and candidate queue in lane 0
     if (lane_id == 0) {
         candidates.init(clamped_ef);
         s_hop_count[warp_in_block] = 0;
     }
-    
+
     // Clear 4-way visited table across warp
     for (int i = lane_id; i < VISITED_HASH_TABLE_SIZE; i += WARP_SIZE) {
         visited_table[i] = 0xFFFFFFFFU;
@@ -101,45 +128,55 @@ __global__ void hnsw_warp_traverse_kernel(
             uint32_t n_idx = n_offset + lane_id;
             uint32_t neighbor_id = (n_idx < degree) ? neighbors[n_idx] : 0xFFFFFFFFU;
 
-            // Check if valid neighbor and not already visited via 4-way hash table
-            bool is_unvisited = false;
-            if (neighbor_id != 0xFFFFFFFFU && neighbor_id < num_nodes) {
-                is_unvisited = insert_visited(visited_table, neighbor_id);
-            }
+            unsigned int valid_mask = __ballot_sync(
+                FULL_WARP_MASK,
+                neighbor_id != 0xFFFFFFFFU && neighbor_id < num_nodes
+            );
 
-            // Ballot to find which lanes have valid unvisited neighbors
-            unsigned int active_mask = __ballot_sync(FULL_WARP_MASK, is_unvisited);
+            // Serialize visited-table probing through lane 0. The 4-way table
+            // is shared per warp, so concurrent inserts from all lanes would
+            // race on colliding hash buckets.
+            while (valid_mask != 0) {
+                int leader_lane = __ffs(valid_mask) - 1;
+                uint32_t target_node =
+                    __shfl_sync(FULL_WARP_MASK, neighbor_id, leader_lane);
 
-            // Sequentially evaluate distances for each active neighbor using the entire warp
-            while (active_mask != 0) {
-                int leader_lane = __ffs(active_mask) - 1;
-                uint32_t target_node = __shfl_sync(FULL_WARP_MASK, neighbor_id, leader_lane);
-
-                // All 32 threads cooperatively compute distance to target_node
-                float dist = warp_compute_distance(
-                    query,
-                    &d_vectors[target_node * dim],
-                    dim,
-                    lane_id,
-                    metric
-                );
-
-                // Lane 0 inserts into candidate queue and records traversal hop
+                int is_unvisited = 0;
                 if (lane_id == 0) {
-                    candidates.insert(target_node, dist);
+                    is_unvisited = insert_visited(visited_table, target_node) ? 1 : 0;
+                }
+                is_unvisited = __shfl_sync(FULL_WARP_MASK, is_unvisited, 0);
 
-                    if (d_out_hops != nullptr && s_hop_count[warp_in_block] < max_hops_per_query) {
-                        uint32_t hop_idx = s_hop_count[warp_in_block]++;
-                        uint32_t out_hop_pos = query_idx * max_hops_per_query + hop_idx;
-                        d_out_hops[out_hop_pos].step = hop_idx;
-                        d_out_hops[out_hop_pos].from_node = current_node;
-                        d_out_hops[out_hop_pos].to_node = target_node;
-                        d_out_hops[out_hop_pos].distance = dist;
+                if (is_unvisited) {
+                    // All 32 threads cooperatively compute distance to target_node
+                    float dist = warp_compute_distance(
+                        query,
+                        &d_vectors[target_node * dim],
+                        dim,
+                        lane_id,
+                        metric
+                    );
+
+                    // Lane 0 inserts into candidate queue and records traversal hop
+                    if (lane_id == 0) {
+                        candidates.insert(target_node, dist);
+                        if constexpr (ENABLE_TRACE) {
+                            TRACE_LOG(
+                                d_out_hops,
+                                s_hop_count,
+                                warp_in_block,
+                                query_idx,
+                                max_hops_per_query,
+                                current_node,
+                                target_node,
+                                dist
+                            );
+                        }
                     }
                 }
 
                 // Clear leader lane from active mask
-                active_mask &= ~(1U << leader_lane);
+                valid_mask &= ~(1U << leader_lane);
             }
         }
         __syncwarp();
@@ -234,24 +271,49 @@ void launch_hnsw_search(
     uint32_t total_warps = num_queries;
     uint32_t num_blocks = (total_warps + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
 
-    hnsw_warp_traverse_kernel<<<num_blocks, THREADS_PER_BLOCK, 0, stream>>>(
-        graph->d_vectors,
-        graph->d_adjacency,
-        graph->d_degree,
-        graph->num_nodes,
-        dim,
-        graph->m_max,
-        graph->entry_point,
-        d_queries,
-        num_queries,
-        top_k,
-        ef_search,
-        metric,
-        d_out_results,
-        d_out_hops,
-        d_out_hop_counts,
-        max_hops_per_query
-    );
+    bool enable_trace = (d_out_hops != nullptr) &&
+                        (d_out_hop_counts != nullptr) &&
+                        (max_hops_per_query > 0);
+
+    if (enable_trace) {
+        hnsw_warp_traverse_kernel<true><<<num_blocks, THREADS_PER_BLOCK, 0, stream>>>(
+            graph->d_vectors,
+            graph->d_adjacency,
+            graph->d_degree,
+            graph->num_nodes,
+            dim,
+            graph->m_max,
+            graph->entry_point,
+            d_queries,
+            num_queries,
+            top_k,
+            ef_search,
+            metric,
+            d_out_results,
+            d_out_hops,
+            d_out_hop_counts,
+            max_hops_per_query
+        );
+    } else {
+        hnsw_warp_traverse_kernel<false><<<num_blocks, THREADS_PER_BLOCK, 0, stream>>>(
+            graph->d_vectors,
+            graph->d_adjacency,
+            graph->d_degree,
+            graph->num_nodes,
+            dim,
+            graph->m_max,
+            graph->entry_point,
+            d_queries,
+            num_queries,
+            top_k,
+            ef_search,
+            metric,
+            d_out_results,
+            d_out_hops,
+            d_out_hop_counts,
+            max_hops_per_query
+        );
+    }
 }
 
 } // namespace flashvector

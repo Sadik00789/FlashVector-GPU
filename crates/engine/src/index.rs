@@ -23,6 +23,17 @@ fn l2_sq(a: &[f32], b: &[f32]) -> f32 {
         .sum()
 }
 
+#[inline]
+fn normalize_slice_in_place(values: &mut [f32], dim: usize) {
+    for vec in values.chunks_exact_mut(dim) {
+        let norm = vec.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-8);
+        let inv = 1.0 / norm;
+        for x in vec.iter_mut() {
+            *x *= inv;
+        }
+    }
+}
+
 pub struct GpuVectorIndex {
     config: IndexConfig,
     metrics: Arc<MetricsTracker>,
@@ -124,6 +135,18 @@ impl GpuVectorIndex {
             "Dimension exceeds maximum supported"
         );
         assert!(!dataset.is_empty(), "Dataset cannot be empty");
+
+        // Normalize the dataset once for cosine: graph construction and IVF-PQ
+        // training must all operate on the same unit-length representation.
+        let normalized_storage: Vec<f32>;
+        let dataset: &[f32] = if self.config.metric == MetricType::Cosine as u32 {
+            let mut normalized = dataset.to_vec();
+            normalize_slice_in_place(&mut normalized, dim);
+            normalized_storage = normalized;
+            &normalized_storage
+        } else {
+            dataset
+        };
 
         let num_vectors = dataset.len() / dim;
         assert!(num_vectors > 0, "Dataset cannot be empty");
@@ -368,7 +391,19 @@ impl GpuVectorIndex {
         let mut d_hops = stream.scratch_hops.lock();
         let mut d_hop_count = stream.scratch_hop_counts.lock();
 
-        d_q.copy_from_host_async(&query[..dim], stream.raw())?;
+        // Normalize the query for cosine so the uploaded representation and the
+        // normalized dataset live in the same unit-sphere space.
+        let normalized_query: Vec<f32>;
+        let query_slice = if self.config.metric == MetricType::Cosine as u32 {
+            let mut q = query[..dim].to_vec();
+            normalize_slice_in_place(&mut q, dim);
+            normalized_query = q;
+            &normalized_query
+        } else {
+            &query[..dim]
+        };
+
+        d_q.copy_from_host_async(query_slice, stream.raw())?;
 
         let graph = HnswGpuGraph {
             d_vectors: self.d_vectors.as_ptr(),
@@ -445,11 +480,21 @@ impl GpuVectorIndex {
         self.validate_search_shape(num_queries, top_k, queries.len())?;
         let start = Instant::now();
 
+        let normalized_queries: Vec<f32>;
+        let queries_ref: &[f32] = if self.config.metric == MetricType::Cosine as u32 {
+            let mut normalized = queries[..total_floats].to_vec();
+            normalize_slice_in_place(&mut normalized, dim);
+            normalized_queries = normalized;
+            &normalized_queries
+        } else {
+            &queries[..total_floats]
+        };
+
         let stream = self.streams.get_stream();
         let mut d_q = stream.scratch_queries.lock();
         let mut d_results = stream.scratch_results.lock();
 
-        d_q.copy_from_host_async(&queries[..total_floats], stream.raw())?;
+        d_q.copy_from_host_async(queries_ref, stream.raw())?;
 
         let graph = HnswGpuGraph {
             d_vectors: self.d_vectors.as_ptr(),
@@ -570,11 +615,21 @@ impl GpuVectorIndex {
         let start = Instant::now();
         let sub_dim = dim / (self.config.m_pq as usize);
 
+        let normalized_queries: Vec<f32>;
+        let queries_ref: &[f32] = if self.config.metric == MetricType::Cosine as u32 {
+            let mut normalized = queries[..total_floats].to_vec();
+            normalize_slice_in_place(&mut normalized, dim);
+            normalized_queries = normalized;
+            &normalized_queries
+        } else {
+            &queries[..total_floats]
+        };
+
         let stream = self.streams.get_stream();
         let mut d_q = stream.scratch_queries.lock();
         let mut d_results = stream.scratch_results.lock();
 
-        d_q.copy_from_host_async(&queries[..total_floats], stream.raw())?;
+        d_q.copy_from_host_async(queries_ref, stream.raw())?;
 
         let tables = IvfPqGpuTables {
             d_centroids: self.d_centroids.as_ptr(),

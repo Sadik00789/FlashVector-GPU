@@ -24,6 +24,10 @@ if [ -n "${TEST_BIN}" ]; then
     echo "==> Running NVIDIA compute-sanitizer racecheck..."
     ${SANITIZER} --tool racecheck "${TEST_BIN}" --nocapture
     echo "==> Racecheck passed with 0 errors!"
+
+    echo "==> Running NVIDIA compute-sanitizer synccheck..."
+    ${SANITIZER} --tool synccheck "${TEST_BIN}" --nocapture
+    echo "==> Synccheck passed with 0 errors!"
 else
     echo "Error: Test binary not found. Run cargo test --no-run first."
 fi

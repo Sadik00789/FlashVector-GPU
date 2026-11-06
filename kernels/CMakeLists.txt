@@ -15,6 +15,13 @@ if(NOT CUDA_NVCC)
     message(FATAL_ERROR "nvcc not found. Set CUDA_TOOLKIT_ROOT_DIR or pass -DCUDA_NVCC=...")
 endif()
 
+option(FLASHVECTOR_TRACE "Enable kernel tracing" OFF)
+set(TRACE_DEFINE "")
+if(FLASHVECTOR_TRACE)
+    set(TRACE_DEFINE "-DFLASHVECTOR_TRACE_MODE=1")
+    add_compile_definitions(FLASHVECTOR_TRACE_MODE=1)
+endif()
+
 set(CUDA_ARCH "86" CACHE STRING "CUDA GPU Architecture (e.g. 86)")
 set(NVCC_GENCODE "-gencode=arch=compute_${CUDA_ARCH},code=sm_${CUDA_ARCH}")
 
@@ -44,7 +51,7 @@ set(OBJ_FILES
 add_custom_command(
     OUTPUT "${BUILD_DIR}/hnsw_traverse.${OBJ_EXT}"
     COMMAND ${CUDA_NVCC} -x cu ${NVCC_GENCODE} -O3 --use_fast_math -std=c++17
-        -I${KERNEL_INC_DIR} -I${CUDA_TOOLKIT_ROOT_DIR}/include ${NVCC_HOST_FLAGS}
+        -I${KERNEL_INC_DIR} -I${CUDA_TOOLKIT_ROOT_DIR}/include ${NVCC_HOST_FLAGS} ${TRACE_DEFINE}
         -c "${KERNEL_SRC_DIR}/hnsw_traverse.cu" -o "${BUILD_DIR}/hnsw_traverse.${OBJ_EXT}"
     DEPENDS "${KERNEL_SRC_DIR}/hnsw_traverse.cu" "${KERNEL_SRC_DIR}/hnsw_traverse.cuh"
             "${KERNEL_SRC_DIR}/distance_metrics.cuh" "${KERNEL_SRC_DIR}/bitonic_topk.cuh"
@@ -55,7 +62,7 @@ add_custom_command(
 add_custom_command(
     OUTPUT "${BUILD_DIR}/ivf_pq_lookup.${OBJ_EXT}"
     COMMAND ${CUDA_NVCC} -x cu ${NVCC_GENCODE} -O3 --use_fast_math -std=c++17
-        -I${KERNEL_INC_DIR} -I${CUDA_TOOLKIT_ROOT_DIR}/include ${NVCC_HOST_FLAGS}
+        -I${KERNEL_INC_DIR} -I${CUDA_TOOLKIT_ROOT_DIR}/include ${NVCC_HOST_FLAGS} ${TRACE_DEFINE}
         -c "${KERNEL_SRC_DIR}/ivf_pq_lookup.cu" -o "${BUILD_DIR}/ivf_pq_lookup.${OBJ_EXT}"
     DEPENDS "${KERNEL_SRC_DIR}/ivf_pq_lookup.cu" "${KERNEL_SRC_DIR}/ivf_pq_lookup.cuh"
             "${KERNEL_SRC_DIR}/distance_metrics.cuh" "${KERNEL_SRC_DIR}/bitonic_topk.cuh"
