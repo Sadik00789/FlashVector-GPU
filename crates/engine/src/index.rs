@@ -1,16 +1,16 @@
+use rayon::prelude::*;
 use std::sync::Arc;
 use std::time::Instant;
-use rayon::prelude::*;
 use tracing::info;
 
 use crate::cluster::{KMeans, ProductQuantizer};
 use crate::ffi::{
-    gpu_hnsw_search_batch, gpu_ivf_pq_search_batch, CudaError, GpuSearchResult,
-    HnswGpuGraph, IndexConfig, IvfPqGpuTables, MetricType, TraversalHop,
+    gpu_device_synchronize, gpu_hnsw_search_batch, gpu_ivf_pq_search_batch, CudaError,
+    GpuSearchResult, HnswGpuGraph, IndexConfig, IvfPqGpuTables, MetricType, TraversalHop,
 };
 use crate::memory::{DeviceBuffer, PinnedBuffer};
 use crate::metrics::MetricsTracker;
-use crate::streams::CudaStreamPool;
+use crate::streams::{CudaStreamPool, MAX_BATCH_SIZE, MAX_HOPS, MAX_SUPPORTED_DIM, MAX_TOP_K};
 
 pub struct GpuVectorIndex {
     config: IndexConfig,
@@ -75,13 +75,53 @@ impl GpuVectorIndex {
         })
     }
 
+    /// Map the raw configuration metric code onto the CUDA metric enum.
+    #[inline]
+    pub fn metric(&self) -> MetricType {
+        match self.config.metric {
+            0 => MetricType::L2,
+            1 => MetricType::Cosine,
+            2 => MetricType::InnerProduct,
+            _ => MetricType::L2,
+        }
+    }
+
+    fn validate_search_shape(
+        &self,
+        num_queries: usize,
+        top_k: usize,
+        query_floats: usize,
+    ) -> Result<(), CudaError> {
+        let dim = self.config.dim as usize;
+        if dim == 0 || dim > MAX_SUPPORTED_DIM {
+            return Err(CudaError::InvalidArgument);
+        }
+        if num_queries > MAX_BATCH_SIZE || query_floats != num_queries * dim {
+            return Err(CudaError::InvalidArgument);
+        }
+        if top_k > MAX_TOP_K {
+            return Err(CudaError::InvalidArgument);
+        }
+        Ok(())
+    }
+
     pub fn build(&mut self, dataset: &[f32]) -> Result<(), CudaError> {
         let dim = self.config.dim as usize;
+        assert!(dim > 0, "Dimension must be greater than zero");
+        assert!(
+            dim <= MAX_SUPPORTED_DIM,
+            "Dimension exceeds maximum supported"
+        );
+        assert!(!dataset.is_empty(), "Dataset cannot be empty");
+
         let num_vectors = dataset.len() / dim;
         assert!(num_vectors > 0, "Dataset cannot be empty");
         self.num_vectors = num_vectors;
 
-        info!("Building FlashVector-GPU Index for {} vectors of dimension {}", num_vectors, dim);
+        info!(
+            "Building FlashVector-GPU Index for {} vectors of dimension {}",
+            num_vectors, dim
+        );
 
         // 1. Store Raw Vectors in Pinned & Device memory
         let mut raw_pinned = PinnedBuffer::new(dataset.len())?;
@@ -156,7 +196,6 @@ impl GpuVectorIndex {
         // 3. Train IVF Voronoi Centroids and Product Quantization Codebooks
         let nlist = (self.config.nlist as usize).min(num_vectors);
         let m_pq = self.config.m_pq as usize;
-
         let kmeans_res = KMeans::fit(dataset, dim, nlist, 10);
         let pq = ProductQuantizer::train(dataset, dim, m_pq, 8);
         let codes = pq.encode(dataset);
@@ -243,9 +282,24 @@ impl GpuVectorIndex {
         ef_search: usize,
     ) -> Result<(Vec<GpuSearchResult>, Vec<TraversalHop>), CudaError> {
         assert!(self.is_built, "Index must be built before searching");
-        let start = Instant::now();
         let dim = self.config.dim as usize;
-        let max_hops = (ef_search * 4).min(2048);
+        assert!(
+            dim <= MAX_SUPPORTED_DIM,
+            "Dimension {} exceeds maximum supported {}",
+            dim,
+            MAX_SUPPORTED_DIM
+        );
+        assert!(
+            query.len() >= dim,
+            "Query is shorter than the index dimension"
+        );
+        self.validate_search_shape(1, top_k, dim)?;
+        if top_k == 0 {
+            return Ok((Vec::new(), Vec::new()));
+        }
+
+        let start = Instant::now();
+        let max_hops = (ef_search.saturating_mul(4)).min(MAX_HOPS);
 
         let stream = self.streams.get_stream();
 
@@ -255,7 +309,6 @@ impl GpuVectorIndex {
         let mut d_hops = stream.scratch_hops.lock();
         let mut d_hop_count = stream.scratch_hop_counts.lock();
 
-        // Upload query vector
         d_q.copy_from_host_async(&query[..dim], stream.raw())?;
 
         let graph = HnswGpuGraph {
@@ -276,7 +329,7 @@ impl GpuVectorIndex {
             self.config.dim,
             top_k as u32,
             ef_search as u32,
-            MetricType::L2,
+            self.metric(),
             d_results.as_mut_ptr(),
             d_hops.as_mut_ptr(),
             d_hop_count.as_mut_ptr(),
@@ -287,7 +340,15 @@ impl GpuVectorIndex {
         // 3. Download results and recorded hop trajectory
         let mut h_results = vec![GpuSearchResult::default(); top_k];
         let mut h_hop_count = vec![0u32; 1];
-        let mut h_all_hops = vec![TraversalHop { step: 0, from_node: 0, to_node: 0, distance: 0.0 }; max_hops];
+        let mut h_all_hops = vec![
+            TraversalHop {
+                step: 0,
+                from_node: 0,
+                to_node: 0,
+                distance: 0.0
+            };
+            max_hops
+        ];
 
         d_results.copy_to_host_async(&mut h_results, stream.raw())?;
         d_hop_count.copy_to_host_async(&mut h_hop_count, stream.raw())?;
@@ -311,17 +372,24 @@ impl GpuVectorIndex {
         ef_search: usize,
     ) -> Result<Vec<GpuSearchResult>, CudaError> {
         assert!(self.is_built, "Index must be built before searching");
-        if num_queries == 0 {
+        if num_queries == 0 || top_k == 0 {
             return Ok(Vec::new());
         }
-        let start = Instant::now();
         let dim = self.config.dim as usize;
-        let stream = self.streams.get_stream();
+        assert!(
+            dim <= MAX_SUPPORTED_DIM,
+            "Dimension {} exceeds maximum supported {}",
+            dim,
+            MAX_SUPPORTED_DIM
+        );
+        let total_floats = num_queries * dim;
+        self.validate_search_shape(num_queries, top_k, queries.len())?;
+        let start = Instant::now();
 
+        let stream = self.streams.get_stream();
         let mut d_q = stream.scratch_queries.lock();
         let mut d_results = stream.scratch_results.lock();
 
-        let total_floats = num_queries * dim;
         d_q.copy_from_host_async(&queries[..total_floats], stream.raw())?;
 
         let graph = HnswGpuGraph {
@@ -341,7 +409,68 @@ impl GpuVectorIndex {
             self.config.dim,
             top_k as u32,
             ef_search as u32,
-            MetricType::L2,
+            self.metric(),
+            d_results.as_mut_ptr(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            0,
+            stream.raw(),
+        )?;
+
+        let total_results = num_queries * top_k;
+        let mut h_results = vec![GpuSearchResult::default(); total_results];
+        d_results.copy_to_host_async(&mut h_results, stream.raw())?;
+        stream.sync()?;
+
+        self.metrics.record_query(start.elapsed(), num_queries);
+        Ok(h_results)
+    }
+
+    /// Zero-copy search for queries already resident in GPU device memory.
+    pub fn batch_search_device_ptr(
+        &self,
+        d_queries: *const f32,
+        num_queries: usize,
+        top_k: usize,
+        ef_search: usize,
+    ) -> Result<Vec<GpuSearchResult>, CudaError> {
+        assert!(self.is_built, "Index must be built before searching");
+        if num_queries == 0 || top_k == 0 {
+            return Ok(Vec::new());
+        }
+        if d_queries.is_null() {
+            return Err(CudaError::InvalidArgument);
+        }
+        // The caller's device buffer may have been produced on another CUDA
+        // stream; drain it before the non-blocking engine stream consumes it.
+        gpu_device_synchronize()?;
+        self.validate_search_shape(num_queries, top_k, num_queries * self.config.dim as usize)?;
+        if top_k > MAX_TOP_K || num_queries > MAX_BATCH_SIZE {
+            return Err(CudaError::InvalidArgument);
+        }
+
+        let start = Instant::now();
+        let stream = self.streams.get_stream();
+        let mut d_results = stream.scratch_results.lock();
+
+        let graph = HnswGpuGraph {
+            d_vectors: self.d_vectors.as_ptr(),
+            d_adjacency: self.d_adjacency.as_ptr(),
+            d_degree: self.d_degrees.as_ptr(),
+            num_nodes: self.num_vectors as u32,
+            dim: self.config.dim,
+            m_max: self.config.m,
+            entry_point: self.entry_point,
+        };
+
+        gpu_hnsw_search_batch(
+            &graph,
+            d_queries,
+            num_queries as u32,
+            self.config.dim,
+            top_k as u32,
+            ef_search as u32,
+            self.metric(),
             d_results.as_mut_ptr(),
             std::ptr::null_mut(),
             std::ptr::null_mut(),
@@ -367,18 +496,25 @@ impl GpuVectorIndex {
         nprobe: usize,
     ) -> Result<Vec<GpuSearchResult>, CudaError> {
         assert!(self.is_built, "Index must be built before searching");
-        if num_queries == 0 {
+        if num_queries == 0 || top_k == 0 {
             return Ok(Vec::new());
         }
-        let start = Instant::now();
         let dim = self.config.dim as usize;
+        assert!(
+            dim <= MAX_SUPPORTED_DIM,
+            "Dimension {} exceeds maximum supported {}",
+            dim,
+            MAX_SUPPORTED_DIM
+        );
+        let total_floats = num_queries * dim;
+        self.validate_search_shape(num_queries, top_k, queries.len())?;
+        let start = Instant::now();
         let sub_dim = dim / (self.config.m_pq as usize);
 
         let stream = self.streams.get_stream();
         let mut d_q = stream.scratch_queries.lock();
         let mut d_results = stream.scratch_results.lock();
 
-        let total_floats = num_queries * dim;
         d_q.copy_from_host_async(&queries[..total_floats], stream.raw())?;
 
         let tables = IvfPqGpuTables {
@@ -389,7 +525,7 @@ impl GpuVectorIndex {
             d_ivf_vec_ids: self.d_ivf_vec_ids.as_ptr(),
             num_vectors: self.num_vectors as u32,
             dim: self.config.dim,
-            nlist: self.config.nlist,
+            nlist: (self.h_centroids.len() / dim) as u32,
             m_pq: self.config.m_pq,
             sub_dim: sub_dim as u32,
         };
@@ -400,7 +536,70 @@ impl GpuVectorIndex {
             num_queries as u32,
             top_k as u32,
             nprobe as u32,
-            MetricType::L2,
+            self.metric(),
+            d_results.as_mut_ptr(),
+            stream.raw(),
+        )?;
+
+        let total_results = num_queries * top_k;
+        let mut h_results = vec![GpuSearchResult::default(); total_results];
+        d_results.copy_to_host_async(&mut h_results, stream.raw())?;
+        stream.sync()?;
+
+        self.metrics.record_query(start.elapsed(), num_queries);
+        Ok(h_results)
+    }
+
+    /// Zero-copy IVF-PQ search for queries already resident in GPU device memory.
+    pub fn batch_search_ivf_device_ptr(
+        &self,
+        d_queries: *const f32,
+        num_queries: usize,
+        top_k: usize,
+        nprobe: usize,
+    ) -> Result<Vec<GpuSearchResult>, CudaError> {
+        assert!(self.is_built, "Index must be built before searching");
+        if num_queries == 0 || top_k == 0 {
+            return Ok(Vec::new());
+        }
+        if d_queries.is_null() {
+            return Err(CudaError::InvalidArgument);
+        }
+        // The caller's device buffer may have been produced on another CUDA
+        // stream; drain it before the non-blocking engine stream consumes it.
+        gpu_device_synchronize()?;
+        self.validate_search_shape(num_queries, top_k, num_queries * self.config.dim as usize)?;
+        if top_k > MAX_TOP_K || num_queries > MAX_BATCH_SIZE {
+            return Err(CudaError::InvalidArgument);
+        }
+
+        let start = Instant::now();
+        let dim = self.config.dim as usize;
+        let sub_dim = dim / (self.config.m_pq as usize);
+
+        let stream = self.streams.get_stream();
+        let mut d_results = stream.scratch_results.lock();
+
+        let tables = IvfPqGpuTables {
+            d_centroids: self.d_centroids.as_ptr(),
+            d_pq_codebooks: self.d_codebooks.as_ptr(),
+            d_pq_codes: self.d_codes.as_ptr(),
+            d_ivf_offsets: self.d_ivf_offsets.as_ptr(),
+            d_ivf_vec_ids: self.d_ivf_vec_ids.as_ptr(),
+            num_vectors: self.num_vectors as u32,
+            dim: self.config.dim,
+            nlist: (self.h_centroids.len() / dim) as u32,
+            m_pq: self.config.m_pq,
+            sub_dim: sub_dim as u32,
+        };
+
+        gpu_ivf_pq_search_batch(
+            &tables,
+            d_queries,
+            num_queries as u32,
+            top_k as u32,
+            nprobe as u32,
+            self.metric(),
             d_results.as_mut_ptr(),
             stream.raw(),
         )?;
@@ -448,4 +647,5 @@ impl GpuVectorIndex {
     pub fn config(&self) -> IndexConfig {
         self.config
     }
+
 }

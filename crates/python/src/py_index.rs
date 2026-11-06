@@ -1,10 +1,11 @@
 use numpy::PyArrayMethods;
+use parking_lot::RwLock;
 use pyo3::prelude::*;
 use pyo3::types::PyAny;
-use parking_lot::RwLock;
 
-use engine::{GpuVectorIndex, IndexConfig, MetricType};
 use crate::dlpack::TensorView;
+use engine::ffi::{gpu_device_synchronize, gpu_memcpy_d2h_async};
+use engine::{GpuVectorIndex, IndexConfig, MetricType};
 
 #[pyclass]
 pub struct FlashVectorGPU {
@@ -43,8 +44,9 @@ impl FlashVectorGPU {
             metric: metric_enum as u32,
         };
 
-        let index = GpuVectorIndex::new(config)
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("CUDA init error: {:?}", e)))?;
+        let index = GpuVectorIndex::new(config).map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("CUDA init error: {:?}", e))
+        })?;
 
         Ok(Self {
             inner: RwLock::new(index),
@@ -61,14 +63,49 @@ impl FlashVectorGPU {
                 self.dim, view.dim
             )));
         }
+        if view.num_vectors == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "Dataset cannot be empty",
+            ));
+        }
 
-        let slice = unsafe {
-            std::slice::from_raw_parts(view.ptr, view.num_vectors * view.dim)
-        };
+        let mut host_data: Vec<f32>;
+        let slice: &[f32];
+
+        if view.is_cuda {
+            let total_elements = view.num_vectors * view.dim;
+            host_data = vec![0.0f32; total_elements];
+            // The tensor may have been produced on another CUDA stream; drain
+            // outstanding work before reading it from the host.
+            gpu_device_synchronize().map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!("CUDA sync failed: {:?}", e))
+            })?;
+            // The device pointer belongs to the caller's live CUDA tensor and
+            // host_data is a CPU destination of the same element count.
+            gpu_memcpy_d2h_async(
+                host_data.as_mut_ptr(),
+                view.ptr,
+                total_elements,
+                std::ptr::null_mut(),
+            )
+            .map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!("CUDA D2H copy failed: {:?}", e))
+            })?;
+            gpu_device_synchronize().map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!("CUDA sync failed: {:?}", e))
+            })?;
+            slice = &host_data;
+        } else {
+            // SAFETY: TensorView::from_pyany only returns host pointers for
+            // contiguous float32 tensors, and the caller keeps the tensor alive
+            // for the duration of this call.
+            slice = unsafe { std::slice::from_raw_parts(view.ptr, view.num_vectors * view.dim) };
+        }
 
         let mut idx = self.inner.write();
-        idx.build(slice)
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Build error: {:?}", e)))?;
+        idx.build(slice).map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("Build error: {:?}", e))
+        })?;
 
         Ok(())
     }
@@ -89,29 +126,51 @@ impl FlashVectorGPU {
                 self.dim, view.dim
             )));
         }
-
-        let slice = unsafe {
-            std::slice::from_raw_parts(view.ptr, view.num_vectors * view.dim)
-        };
+        if view.num_vectors == 0 {
+            let empty_labels =
+                numpy::PyArray1::from_vec_bound(py, Vec::<u32>::new()).reshape([0, top_k])?;
+            let empty_dists =
+                numpy::PyArray1::from_vec_bound(py, Vec::<f32>::new()).reshape([0, top_k])?;
+            return Ok((empty_labels.into(), empty_dists.into()));
+        }
 
         let idx = self.inner.read();
-        let results = idx.batch_search(slice, view.num_vectors, top_k, ef_search)
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Batch search error: {:?}", e)))?;
+        let results = if view.is_cuda {
+            // Zero-copy path: the CUDA tensor's device pointer is consumed directly
+            // by the HNSW kernel, avoiding a D2H copy followed by an H2D re-upload.
+            idx.batch_search_device_ptr(view.ptr, view.num_vectors, top_k, ef_search)
+                .map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "Batch search error: {:?}",
+                        e
+                    ))
+                })?
+        } else {
+            // SAFETY: TensorView::from_pyany only returns host pointers for
+            // contiguous float32 tensors, and the caller keeps the tensor alive
+            // for the duration of this call.
+            let slice =
+                unsafe { std::slice::from_raw_parts(view.ptr, view.num_vectors * view.dim) };
+            idx.batch_search(slice, view.num_vectors, top_k, ef_search)
+                .map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "Batch search error: {:?}",
+                        e
+                    ))
+                })?
+        };
 
         let mut all_labels = Vec::with_capacity(view.num_vectors * top_k);
         let mut all_dists = Vec::with_capacity(view.num_vectors * top_k);
-
         for r in results {
             all_labels.push(r.id);
             all_dists.push(r.distance);
         }
 
-        let labels_arr = numpy::PyArray1::from_vec_bound(py, all_labels);
-        let dists_arr = numpy::PyArray1::from_vec_bound(py, all_dists);
-
-        let labels_2d = labels_arr.reshape([view.num_vectors, top_k])?;
-        let dists_2d = dists_arr.reshape([view.num_vectors, top_k])?;
-
+        let labels_2d =
+            numpy::PyArray1::from_vec_bound(py, all_labels).reshape([view.num_vectors, top_k])?;
+        let dists_2d =
+            numpy::PyArray1::from_vec_bound(py, all_dists).reshape([view.num_vectors, top_k])?;
         Ok((labels_2d.into(), dists_2d.into()))
     }
 
@@ -131,29 +190,49 @@ impl FlashVectorGPU {
                 self.dim, view.dim
             )));
         }
-
-        let slice = unsafe {
-            std::slice::from_raw_parts(view.ptr, view.num_vectors * view.dim)
-        };
+        if view.num_vectors == 0 {
+            let empty_labels =
+                numpy::PyArray1::from_vec_bound(py, Vec::<u32>::new()).reshape([0, top_k])?;
+            let empty_dists =
+                numpy::PyArray1::from_vec_bound(py, Vec::<f32>::new()).reshape([0, top_k])?;
+            return Ok((empty_labels.into(), empty_dists.into()));
+        }
 
         let idx = self.inner.read();
-        let results = idx.batch_search_ivf(slice, view.num_vectors, top_k, nprobe)
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Batch IVF search error: {:?}", e)))?;
+        let results = if view.is_cuda {
+            idx.batch_search_ivf_device_ptr(view.ptr, view.num_vectors, top_k, nprobe)
+                .map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "Batch IVF search error: {:?}",
+                        e
+                    ))
+                })?
+        } else {
+            // SAFETY: TensorView::from_pyany only returns host pointers for
+            // contiguous float32 tensors, and the caller keeps the tensor alive
+            // for the duration of this call.
+            let slice =
+                unsafe { std::slice::from_raw_parts(view.ptr, view.num_vectors * view.dim) };
+            idx.batch_search_ivf(slice, view.num_vectors, top_k, nprobe)
+                .map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "Batch IVF search error: {:?}",
+                        e
+                    ))
+                })?
+        };
 
         let mut all_labels = Vec::with_capacity(view.num_vectors * top_k);
         let mut all_dists = Vec::with_capacity(view.num_vectors * top_k);
-
         for r in results {
             all_labels.push(r.id);
             all_dists.push(r.distance);
         }
 
-        let labels_arr = numpy::PyArray1::from_vec_bound(py, all_labels);
-        let dists_arr = numpy::PyArray1::from_vec_bound(py, all_dists);
-
-        let labels_2d = labels_arr.reshape([view.num_vectors, top_k])?;
-        let dists_2d = dists_arr.reshape([view.num_vectors, top_k])?;
-
+        let labels_2d =
+            numpy::PyArray1::from_vec_bound(py, all_labels).reshape([view.num_vectors, top_k])?;
+        let dists_2d =
+            numpy::PyArray1::from_vec_bound(py, all_dists).reshape([view.num_vectors, top_k])?;
         Ok((labels_2d.into(), dists_2d.into()))
     }
 
@@ -167,6 +246,7 @@ impl FlashVectorGPU {
 
     pub fn get_stats(&self) -> PyResult<String> {
         let stats = self.inner.read().metrics().get_stats();
-        serde_json::to_string(&stats).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+        serde_json::to_string(&stats)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
     }
 }

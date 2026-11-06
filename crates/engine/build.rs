@@ -14,7 +14,31 @@ fn find_cuda_root() -> PathBuf {
     if Path::new("/usr/local/cuda").exists() {
         return PathBuf::from("/usr/local/cuda");
     }
+    if cfg!(target_os = "windows") {
+        let base = PathBuf::from(r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA");
+        if let Ok(entries) = std::fs::read_dir(&base) {
+            let mut candidates: Vec<PathBuf> = entries
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| path.join("bin").join("nvcc.exe").exists())
+                .collect();
+            candidates.sort();
+            if let Some(path) = candidates.pop() {
+                return path;
+            }
+        }
+    }
     PathBuf::from("/usr/local/cuda")
+}
+
+fn command_available(name: &str, version_flag: &str) -> bool {
+    Command::new(name)
+        .arg(version_flag)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
 }
 
 fn main() {
@@ -24,15 +48,31 @@ fn main() {
     let kernels_build_dir = kernels_dir.join("build");
 
     let cuda_root = find_cuda_root();
-    let cuda_lib64 = cuda_root.join("lib64");
+    let windows = cfg!(target_os = "windows");
+    let cuda_lib_dir = if windows {
+        cuda_root.join("lib").join("x64")
+    } else {
+        cuda_root.join("lib64")
+    };
 
     // Build CUDA static library using CMake
     std::fs::create_dir_all(&kernels_build_dir).expect("Failed to create kernels/build");
 
-    let cmake_status = Command::new("cmake")
+    let cuda_root_arg = cuda_root.display().to_string().replace('\\', "/");
+    let mut configure = Command::new("cmake");
+    configure
         .current_dir(&kernels_build_dir)
         .arg("-DCMAKE_BUILD_TYPE=Release")
-        .arg(format!("-DCUDA_TOOLKIT_ROOT_DIR={}", cuda_root.display()))
+        .arg(format!("-DCUDA_TOOLKIT_ROOT_DIR={}", cuda_root_arg));
+
+    if windows
+        && std::env::var_os("CMAKE_GENERATOR").is_none()
+        && command_available("ninja", "--version")
+    {
+        configure.args(["-G", "Ninja"]);
+    }
+
+    let cmake_status = configure
         .arg("..")
         .status()
         .expect("Failed to execute cmake for CUDA kernels");
@@ -52,18 +92,33 @@ fn main() {
     }
 
     // Instruct Cargo to link the generated static library and CUDA runtime
-    println!("cargo:rustc-link-search=native={}", kernels_build_dir.display());
+    println!(
+        "cargo:rustc-link-search=native={}",
+        kernels_build_dir.display()
+    );
     println!("cargo:rustc-link-lib=static=gpukernels");
 
-    if cuda_lib64.exists() {
-        println!("cargo:rustc-link-search=native={}", cuda_lib64.display());
+    if cuda_lib_dir.exists() {
+        println!("cargo:rustc-link-search=native={}", cuda_lib_dir.display());
     }
     println!("cargo:rustc-link-lib=dylib=cudart");
-    println!("cargo:rustc-link-lib=dylib=cuda");
-    println!("cargo:rustc-link-lib=dylib=stdc++");
+    if !windows {
+        println!("cargo:rustc-link-lib=dylib=stdc++");
+    }
 
     // Re-run triggers
-    println!("cargo:rerun-if-changed={}", kernels_dir.join("CMakeLists.txt").display());
-    println!("cargo:rerun-if-changed={}", kernels_dir.join("include").display());
-    println!("cargo:rerun-if-changed={}", kernels_dir.join("src").display());
+    println!(
+        "cargo:rerun-if-changed={}",
+        kernels_dir.join("CMakeLists.txt").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        kernels_dir.join("include").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        kernels_dir.join("src").display()
+    );
+    println!("cargo:rerun-if-env-changed=CUDA_HOME");
+    println!("cargo:rerun-if-env-changed=CUDA_PATH");
 }

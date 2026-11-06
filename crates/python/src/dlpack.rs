@@ -5,8 +5,9 @@ pub struct TensorView {
     pub ptr: *const f32,
     pub num_vectors: usize,
     pub dim: usize,
-    #[allow(dead_code)]
     pub is_cuda: bool,
+    // Keeps a materialized contiguous copy alive for the lifetime of the view.
+    _owner: Option<PyObject>,
 }
 
 impl TensorView {
@@ -34,12 +35,15 @@ impl TensorView {
                 false
             };
 
-            // Ensure contiguous memory layout
+            // Ensure contiguous memory layout. A materialized copy must be kept
+            // alive until the caller is done reading the returned pointer.
             let is_contiguous: bool = obj.call_method0("is_contiguous")?.extract()?;
-            let tensor_obj = if !is_contiguous {
-                obj.call_method0("contiguous")?
+            let (tensor_obj, owner) = if is_contiguous {
+                (obj.clone(), None)
             } else {
-                obj.clone()
+                let contiguous = obj.call_method0("contiguous")?;
+                let owner = contiguous.clone().unbind();
+                (contiguous, Some(owner))
             };
 
             let data_ptr: usize = tensor_obj.call_method0("data_ptr")?.extract()?;
@@ -49,6 +53,7 @@ impl TensorView {
                 num_vectors: shape[0],
                 dim: shape[1],
                 is_cuda,
+                _owner: owner,
             });
         }
 
@@ -69,14 +74,44 @@ impl TensorView {
                 ));
             }
 
+            // NumPy exposes `strides: None` for C-contiguous arrays, otherwise a
+            // tuple of byte strides. Only C-contiguous input is accepted.
+            if let Ok(strides_obj) = dict.get_item("strides") {
+                if !strides_obj.is_none() {
+                    let strides: Vec<isize> = strides_obj.extract()?;
+                    let mut expected = 4isize;
+                    let mut is_c_contiguous = strides.len() == shape.len();
+                    if is_c_contiguous {
+                        for (axis, &dim) in shape.iter().enumerate().rev() {
+                            if strides[axis] != expected {
+                                is_c_contiguous = false;
+                                break;
+                            }
+                            expected *= dim as isize;
+                        }
+                    }
+                    if !is_c_contiguous {
+                        return Err(pyo3::exceptions::PyValueError::new_err(
+                            "Expected a C-contiguous numpy array",
+                        ));
+                    }
+                }
+            }
+
             let data_tuple: (usize, bool) = dict.get_item("data")?.extract()?;
             let ptr = data_tuple.0 as *const f32;
+            if ptr.is_null() {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "Numpy array data pointer is null",
+                ));
+            }
 
             return Ok(Self {
                 ptr,
                 num_vectors: shape[0],
                 dim: shape[1],
                 is_cuda: false,
+                _owner: None,
             });
         }
 

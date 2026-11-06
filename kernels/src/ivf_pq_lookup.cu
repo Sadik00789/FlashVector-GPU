@@ -27,6 +27,7 @@ __global__ void ivf_pq_adc_kernel(
 ) {
     uint32_t query_idx = blockIdx.x;
     if (query_idx >= num_queries) return;
+    if (nprobe == 0 || top_k == 0 || m_pq == 0) return;
 
     int tid = threadIdx.x;
     int block_size = blockDim.x;
@@ -36,12 +37,22 @@ __global__ void ivf_pq_adc_kernel(
     // [0 .. m_pq * SMEM_PQ_STRIDE]: Distance Lookup Table (LUT)
     // [offset .. offset + nprobe]: Probed centroid IDs
     // [offset .. offset + nprobe]: Probed centroid distances
-    // [offset .. offset + top_k]: Merged top-k results
+    // [aligned offset .. aligned offset + top_k]: Merged top-k results
     extern __shared__ float smem_pool[];
     float* smem_lut = smem_pool; // size: m_pq * 257
     uint32_t* smem_probed_clusters = (uint32_t*)&smem_lut[m_pq * SMEM_PQ_STRIDE];
     float* smem_cluster_dists = (float*)&smem_probed_clusters[nprobe];
-    GpuSearchResult* smem_merged_topk = (GpuSearchResult*)&smem_cluster_dists[nprobe];
+
+    // GpuSearchResult is 8-byte aligned; the raw float/uint offsets above are
+    // not necessarily 8-byte aligned when m_pq is odd, so round the byte offset
+    // up before reinterpreting the tail of the shared-memory pool.
+    size_t lut_bytes = (size_t)m_pq * SMEM_PQ_STRIDE * sizeof(float);
+    size_t probed_bytes = (size_t)nprobe * sizeof(uint32_t);
+    size_t dist_bytes = (size_t)nprobe * sizeof(float);
+    size_t raw_offset = lut_bytes + probed_bytes + dist_bytes;
+    size_t aligned_offset = (raw_offset + 7u) & ~7u;
+    GpuSearchResult* smem_merged_topk =
+        (GpuSearchResult*)((char*)smem_pool + aligned_offset);
 
     // Initialize probed clusters list in thread 0
     if (tid == 0) {
@@ -134,9 +145,11 @@ __global__ void ivf_pq_adc_kernel(
     }
     __syncthreads();
 
-    // 3. Scan assigned inverted lists and accumulate ADC distances
-    CandidateList<64> local_candidates;
-    local_candidates.init(top_k < 64 ? top_k : 64);
+    // 3. Scan assigned inverted lists and accumulate ADC distances.
+    // Keep the thread-local collector compact: a 256-entry list would spill
+    // several kilobytes per thread to local memory and destroy throughput.
+    CandidateList<32> local_candidates;
+    local_candidates.init(top_k < 32 ? top_k : 32);
 
     for (uint32_t p = 0; p < nprobe; ++p) {
         uint32_t cluster_id = smem_probed_clusters[p];
@@ -165,7 +178,7 @@ __global__ void ivf_pq_adc_kernel(
     __syncthreads();
 
     // 4. Block-wide parallel top-k reduction/merger across all 128 threads
-    block_bitonic_merge_topk<64>(
+    block_bitonic_merge_topk<32>(
         local_candidates,
         smem_merged_topk,
         (int)top_k,
@@ -192,16 +205,26 @@ void launch_ivf_pq_search(
     GpuSearchResult* d_out_results,
     cudaStream_t stream
 ) {
-    if (num_queries == 0) return;
+    if (num_queries == 0 || top_k == 0 || tables->m_pq == 0 || tables->nlist == 0) return;
+
+    // The host enforces top_k <= 256; clamp again here so an out-of-contract
+    // caller can never overflow the dynamic shared-memory merge buffer.
+    if (top_k > 256) top_k = 256;
+
+    uint32_t clamped_nprobe = nprobe;
+    if (clamped_nprobe == 0) clamped_nprobe = 1;
+    if (clamped_nprobe > tables->nlist) clamped_nprobe = tables->nlist;
 
     dim3 grid(num_queries);
     dim3 block(BLOCK_SIZE_IVF);
 
-    // Shared memory: LUT (m_pq * 257 floats) + probed list (nprobe u32 + nprobe f32) + top-k merged results
-    size_t smem_bytes = (tables->m_pq * SMEM_PQ_STRIDE * sizeof(float)) + 
-                        (nprobe * sizeof(uint32_t)) + 
-                        (nprobe * sizeof(float)) + 
-                        (top_k * sizeof(GpuSearchResult));
+    // Shared memory: LUT (m_pq * 257 floats) + probed list (nprobe u32 +
+    // nprobe f32) + 8-byte-aligned top-k merged results.
+    size_t raw_smem = ((size_t)tables->m_pq * SMEM_PQ_STRIDE * sizeof(float)) +
+                      ((size_t)clamped_nprobe * sizeof(uint32_t)) +
+                      ((size_t)clamped_nprobe * sizeof(float));
+    size_t aligned_smem = (raw_smem + 7u) & ~7u;
+    size_t smem_bytes = aligned_smem + ((size_t)top_k * sizeof(GpuSearchResult));
 
     ivf_pq_adc_kernel<<<grid, block, smem_bytes, stream>>>(
         tables->d_centroids,
@@ -217,7 +240,7 @@ void launch_ivf_pq_search(
         d_queries,
         num_queries,
         top_k,
-        nprobe,
+        clamped_nprobe,
         metric,
         d_out_results
     );
