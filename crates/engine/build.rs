@@ -1,26 +1,63 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+fn cuda_lib_dir(root: &Path) -> PathBuf {
+    if cfg!(target_os = "windows") {
+        root.join("lib").join("x64")
+    } else {
+        root.join("lib64")
+    }
+}
+
+fn is_cuda_toolkit(root: &Path) -> bool {
+    let (nvcc, cudart) = if cfg!(target_os = "windows") {
+        ("nvcc.exe", "cudart.lib")
+    } else {
+        ("nvcc", "libcudart.so")
+    };
+    root.join("bin").join(nvcc).is_file() && cuda_lib_dir(root).join(cudart).is_file()
+}
+
+fn nvcc_root_on_path() -> Option<PathBuf> {
+    let nvcc = if cfg!(target_os = "windows") {
+        "nvcc.exe"
+    } else {
+        "nvcc"
+    };
+    std::env::var_os("PATH").and_then(|path| {
+        std::env::split_paths(&path)
+            .find(|dir| dir.join(nvcc).is_file())
+            .and_then(|dir| dir.parent().map(Path::to_path_buf))
+    })
+}
+
 fn find_cuda_root() -> PathBuf {
-    if let Ok(path) = std::env::var("CUDA_HOME") {
-        return PathBuf::from(path);
+    let env_candidates = ["CUDA_HOME", "CUDA_PATH"]
+        .iter()
+        .filter_map(|name| std::env::var(name).ok())
+        .map(PathBuf::from);
+    let path_candidate = nvcc_root_on_path();
+    let default_candidates = [
+        PathBuf::from("/usr/local/cuda-12.6"),
+        PathBuf::from("/usr/local/cuda"),
+    ];
+
+    for candidate in env_candidates
+        .chain(path_candidate)
+        .chain(default_candidates)
+    {
+        if is_cuda_toolkit(&candidate) {
+            return candidate;
+        }
     }
-    if let Ok(path) = std::env::var("CUDA_PATH") {
-        return PathBuf::from(path);
-    }
-    if Path::new("/usr/local/cuda-12.6").exists() {
-        return PathBuf::from("/usr/local/cuda-12.6");
-    }
-    if Path::new("/usr/local/cuda").exists() {
-        return PathBuf::from("/usr/local/cuda");
-    }
+
     if cfg!(target_os = "windows") {
         let base = PathBuf::from(r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA");
         if let Ok(entries) = std::fs::read_dir(&base) {
             let mut candidates: Vec<PathBuf> = entries
                 .flatten()
                 .map(|entry| entry.path())
-                .filter(|path| path.join("bin").join("nvcc.exe").exists())
+                .filter(|path| is_cuda_toolkit(path))
                 .collect();
             candidates.sort();
             if let Some(path) = candidates.pop() {
@@ -28,7 +65,11 @@ fn find_cuda_root() -> PathBuf {
             }
         }
     }
-    PathBuf::from("/usr/local/cuda")
+
+    panic!(
+        "CUDA toolkit not found: expected nvcc and cudart in a toolkit root. \
+         Set CUDA_HOME to a CUDA toolkit directory (for example the pip `nvidia/cu13` root)."
+    );
 }
 
 fn command_available(name: &str, version_flag: &str) -> bool {
@@ -49,11 +90,7 @@ fn main() {
 
     let cuda_root = find_cuda_root();
     let windows = cfg!(target_os = "windows");
-    let cuda_lib_dir = if windows {
-        cuda_root.join("lib").join("x64")
-    } else {
-        cuda_root.join("lib64")
-    };
+    let cuda_lib = cuda_lib_dir(&cuda_root);
 
     // Build CUDA static library using CMake
     std::fs::create_dir_all(&kernels_build_dir).expect("Failed to create kernels/build");
@@ -98,8 +135,8 @@ fn main() {
     );
     println!("cargo:rustc-link-lib=static=gpukernels");
 
-    if cuda_lib_dir.exists() {
-        println!("cargo:rustc-link-search=native={}", cuda_lib_dir.display());
+    if cuda_lib.exists() {
+        println!("cargo:rustc-link-search=native={}", cuda_lib.display());
     }
     println!("cargo:rustc-link-lib=dylib=cudart");
     if !windows {
