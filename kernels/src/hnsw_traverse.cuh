@@ -11,13 +11,16 @@ namespace flashvector {
 
 #define MAX_BEAM_WIDTH 256
 #define MAX_NEIGHBORS_PER_NODE 64
-#define VISITED_HASH_TABLE_SIZE 1024
+// 4 warps x 2048 entries x 4 bytes = 32 KB. Combined with the per-warp
+// candidate queues this stays below the 48 KB Ampere static smem limit.
+#define VISITED_HASH_TABLE_SIZE 2048
 
 // 4-Way open-addressing visited hash table with linear probing
 __device__ __forceinline__ bool insert_visited(uint32_t* table, uint32_t node_id) {
-    uint32_t h = (node_id * 2654435761U) % VISITED_HASH_TABLE_SIZE;
+    uint32_t h = (node_id * 2654435761U) & (VISITED_HASH_TABLE_SIZE - 1);
+    #pragma unroll
     for (int p = 0; p < 4; ++p) {
-        uint32_t idx = (h + p) % VISITED_HASH_TABLE_SIZE;
+        uint32_t idx = (h + p) & (VISITED_HASH_TABLE_SIZE - 1);
         if (table[idx] == node_id) return false; // Already visited
         if (table[idx] == 0xFFFFFFFFU) {
             table[idx] = node_id;

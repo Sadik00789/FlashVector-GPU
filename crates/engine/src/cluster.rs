@@ -191,6 +191,14 @@ impl ProductQuantizer {
                 let res = KMeans::fit(&sub_vectors, sub_dim, k_actual, iters);
 
                 sub_codebook[..k_actual * sub_dim].copy_from_slice(&res.centroids);
+
+                // Unused codebook slots must be unreachable during encode(); a
+                // sentinel distance prevents zero centroids from attracting codes.
+                if k_actual < num_centroids {
+                    for c in k_actual..num_centroids {
+                        sub_codebook[c * sub_dim..(c + 1) * sub_dim].fill(f32::MAX);
+                    }
+                }
             });
 
         Self {

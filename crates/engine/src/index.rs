@@ -12,6 +12,17 @@ use crate::memory::{DeviceBuffer, PinnedBuffer};
 use crate::metrics::MetricsTracker;
 use crate::streams::{CudaStreamPool, MAX_BATCH_SIZE, MAX_HOPS, MAX_SUPPORTED_DIM, MAX_TOP_K};
 
+#[inline]
+fn l2_sq(a: &[f32], b: &[f32]) -> f32 {
+    a.iter()
+        .zip(b.iter())
+        .map(|(&x, &y)| {
+            let d = x - y;
+            d * d
+        })
+        .sum()
+}
+
 pub struct GpuVectorIndex {
     config: IndexConfig,
     metrics: Arc<MetricsTracker>,
@@ -131,13 +142,11 @@ impl GpuVectorIndex {
         let stream = self.streams.get_stream();
         d_vecs.copy_from_pinned_async(&raw_pinned, stream.raw())?;
 
-        // 2. Build True Parallel KNN Small-World Graph Layer using Rayon
+        // 2. Build the HNSW graph using Malkov-Yashunin diverse neighbor selection.
         let m = self.config.m as usize;
+        let ef_construction = self.config.ef_construction as usize;
         let mut h_adj = PinnedBuffer::new(num_vectors * m)?;
         let mut h_deg = PinnedBuffer::new(num_vectors)?;
-
-        // Parallel small-world KNN construction
-        let sample_pool_size = (m * 8).min(num_vectors);
 
         let adj_chunks: Vec<(usize, Vec<u32>)> = (0..num_vectors)
             .into_par_iter()
@@ -145,38 +154,74 @@ impl GpuVectorIndex {
                 let vi = &dataset[i * dim..(i + 1) * dim];
                 let mut rng = rand::thread_rng();
 
-                // Candidate pool: random sample + spatial locality
-                let mut candidates: Vec<usize> = Vec::with_capacity(sample_pool_size);
-                for _ in 0..sample_pool_size {
+                let sample_size = ef_construction.min(num_vectors.saturating_sub(1));
+                let mut candidate_set = std::collections::HashSet::with_capacity(sample_size + m);
+                while candidate_set.len() < sample_size {
                     let r = rand::Rng::gen_range(&mut rng, 0..num_vectors);
                     if r != i {
-                        candidates.push(r);
+                        candidate_set.insert(r);
                     }
                 }
-                // Add neighboring linear slots
-                for offset in 1..=m {
-                    candidates.push((i + offset) % num_vectors);
+                for offset in 1..=(m / 2).max(1) {
+                    let forward = (i + offset) % num_vectors;
+                    let backward = (i + num_vectors - offset) % num_vectors;
+                    if forward != i {
+                        candidate_set.insert(forward);
+                    }
+                    if backward != i {
+                        candidate_set.insert(backward);
+                    }
                 }
 
-                // Compute exact L2 distances to candidate pool
-                let mut scored: Vec<(u32, f32)> = candidates
+                let mut scored: Vec<(u32, f32)> = candidate_set
                     .into_iter()
                     .map(|cand_id| {
                         let vj = &dataset[cand_id * dim..(cand_id + 1) * dim];
-                        let dist: f32 = vi.iter().zip(vj.iter()).map(|(&a, &b)| (a - b) * (a - b)).sum();
-                        (cand_id as u32, dist)
+                        (cand_id as u32, l2_sq(vi, vj))
                     })
                     .collect();
-
                 scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-                scored.dedup_by_key(|x| x.0);
 
-                let mut row = vec![0xFFFFFFFFu32; m];
-                let deg = scored.len().min(m);
-                for k in 0..deg {
-                    row[k] = scored[k].0;
+                // HNSW heuristic: keep a candidate only if it is closer to the base
+                // node than to every neighbor selected so far. This preserves the
+                // long-range edges that keep greedy beam search from getting trapped.
+                let mut selected: Vec<(u32, f32)> = Vec::with_capacity(m);
+                for &(cand_id, cand_dist) in &scored {
+                    if selected.len() >= m {
+                        break;
+                    }
+                    let cand_vec = &dataset[cand_id as usize * dim..(cand_id as usize + 1) * dim];
+                    let mut is_good = true;
+                    for &(sel_id, _) in &selected {
+                        let sel_vec = &dataset[sel_id as usize * dim..(sel_id as usize + 1) * dim];
+                        if l2_sq(cand_vec, sel_vec) < cand_dist {
+                            is_good = false;
+                            break;
+                        }
+                    }
+                    if is_good {
+                        selected.push((cand_id, cand_dist));
+                    }
                 }
 
+                // Fill any slots pruned by the heuristic with the nearest remaining
+                // candidates so every node keeps up to `m` outgoing edges.
+                if selected.len() < m {
+                    for &(cand_id, cand_dist) in &scored {
+                        if selected.len() >= m {
+                            break;
+                        }
+                        if !selected.iter().any(|(id, _)| *id == cand_id) {
+                            selected.push((cand_id, cand_dist));
+                        }
+                    }
+                }
+
+                let mut row = vec![0xFFFFFFFFu32; m];
+                let deg = selected.len().min(m);
+                for (k, (id, _)) in selected.iter().take(deg).enumerate() {
+                    row[k] = *id;
+                }
                 (deg, row)
             })
             .collect();
@@ -188,6 +233,17 @@ impl GpuVectorIndex {
             }
         }
 
+        // The highest-degree node is the most connected hub and is the best
+        // entry point for greedy descent.
+        let mut best_node = 0u32;
+        let mut best_degree = 0u32;
+        for i in 0..num_vectors {
+            if h_deg[i] > best_degree {
+                best_degree = h_deg[i];
+                best_node = i as u32;
+            }
+        }
+
         let mut d_adj = DeviceBuffer::new(num_vectors * m)?;
         let mut d_deg = DeviceBuffer::new(num_vectors)?;
         d_adj.copy_from_pinned_async(&h_adj, stream.raw())?;
@@ -196,6 +252,9 @@ impl GpuVectorIndex {
         // 3. Train IVF Voronoi Centroids and Product Quantization Codebooks
         let nlist = (self.config.nlist as usize).min(num_vectors);
         let m_pq = self.config.m_pq as usize;
+        assert!(m_pq > 0, "m_pq must be greater than zero");
+        assert!(dim % m_pq == 0, "Dimension must be divisible by m_pq");
+
         let kmeans_res = KMeans::fit(dataset, dim, nlist, 10);
         let pq = ProductQuantizer::train(dataset, dim, m_pq, 8);
         let codes = pq.encode(dataset);
@@ -256,7 +315,7 @@ impl GpuVectorIndex {
         self.d_ivf_offsets = d_off;
         self.h_ivf_vec_ids = h_vids;
         self.d_ivf_vec_ids = d_vids;
-        self.entry_point = 0;
+        self.entry_point = best_node;
         self.is_built = true;
 
         info!("FlashVector-GPU Index successfully built and synchronized to VRAM");
