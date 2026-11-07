@@ -158,7 +158,7 @@ The full search-parameter sweep for both FlashVector-GPU engines:
 | IVF-PQ | `nprobe = 32` | 0.5422 | 9,522 | 105.0 µs |
 | IVF-PQ | `nprobe = 64` | 0.5420 | 5,800 | 172.4 µs |
 
-IVF-PQ throughput scales with the number of probed lists, while recall saturates near 0.54 beyond `nprobe = 16`: at that point the residual error is quantization from the 8-bit, 16-sub-quantizer codebook rather than missing candidates. Widening the codebook raises the ceiling at the cost of memory and build time. A Meta Faiss-GPU comparison is not included because no `faiss` build is available for the Python 3.15 toolchain used for these runs.
+IVF-PQ throughput scales with the number of probed lists, while recall saturates near 0.54 beyond `nprobe = 16`: at that point the residual error is quantization from the 8-bit, 16-sub-quantizer codebook rather than missing candidates. Widening the codebook raises the ceiling at the cost of memory and build time.
 
 ---
 

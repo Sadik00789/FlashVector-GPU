@@ -4,27 +4,31 @@ import React from 'react';
 import { TrendingUp, Award } from 'lucide-react';
 
 export default function ComparisonPlot() {
-  // Pareto frontier data points: [Recall@10, QPS]
-  const flashVectorData = [
-    { recall: 0.85, qps: 185000 },
-    { recall: 0.92, qps: 142000 },
-    { recall: 0.96, qps: 98000 },
-    { recall: 0.985, qps: 64000 },
-    { recall: 0.995, qps: 38000 },
+  // Pareto frontier data points: [Recall@10, QPS] measured on SIFT1M
+  // (1,000,000 x 128-D) against the ann-benchmarks ground truth with 1,000
+  // queries, on an NVIDIA RTX 3050 Laptop (sm_86). See the README benchmark
+  // section for the full parameter sweep.
+  const flashVectorHnswData = [
+    { recall: 0.7568, qps: 93686 },
+    { recall: 0.8767, qps: 51229 },
+    { recall: 0.9511, qps: 38338 },
+    { recall: 0.9848, qps: 15719 },
+    { recall: 0.9958, qps: 5629 },
   ];
 
-  const faissGpuData = [
-    { recall: 0.82, qps: 110000 },
-    { recall: 0.88, qps: 78000 },
-    { recall: 0.93, qps: 45000 },
-    { recall: 0.96, qps: 22000 },
+  const flashVectorIvfPqData = [
+    { recall: 0.352, qps: 83062 },
+    { recall: 0.496, qps: 34657 },
+    { recall: 0.5269, qps: 22697 },
+    { recall: 0.5382, qps: 14906 },
+    { recall: 0.5422, qps: 9522 },
+    { recall: 0.542, qps: 5800 },
   ];
 
   const hnswLibCpuData = [
-    { recall: 0.85, qps: 28000 },
-    { recall: 0.92, qps: 18000 },
-    { recall: 0.96, qps: 11000 },
-    { recall: 0.985, qps: 6200 },
+    { recall: 0.98, qps: 13413 },
+    { recall: 0.9948, qps: 7427 },
+    { recall: 0.9981, qps: 4342 },
   ];
 
   // SVG dimensions
@@ -32,10 +36,10 @@ export default function ComparisonPlot() {
   const height = 180;
   const pad = { top: 20, right: 20, bottom: 30, left: 45 };
 
-  const minR = 0.80;
+  const minR = 0.30;
   const maxR = 1.00;
   const minQ = 0;
-  const maxQ = 200000;
+  const maxQ = 100000;
 
   const toX = (r: number) => pad.left + ((r - minR) / (maxR - minR)) * (width - pad.left - pad.right);
   const toY = (q: number) => height - pad.bottom - ((q - minQ) / (maxQ - minQ)) * (height - pad.top - pad.bottom);
@@ -60,7 +64,7 @@ export default function ComparisonPlot() {
           </div>
         </div>
         <span className="flex items-center gap-1 text-[11px] font-mono text-emerald-400 bg-emerald-500/10 px-2 py-0.5 rounded border border-emerald-500/20">
-          <Award className="w-3 h-3" /> 4.2x Faster
+          <Award className="w-3 h-3" /> Peak Recall@10 0.9958
         </span>
       </div>
 
@@ -68,7 +72,7 @@ export default function ComparisonPlot() {
       <div className="relative w-full flex justify-center bg-black/40 p-2 rounded-xl border border-white/5">
         <svg viewBox={`0 0 ${width} ${height}`} className="w-full h-auto overflow-visible font-mono text-[9px]">
           {/* Grid lines */}
-          {[0.85, 0.90, 0.95, 1.00].map((r) => (
+          {[0.40, 0.60, 0.80, 1.00].map((r) => (
             <line
               key={r}
               x1={toX(r)}
@@ -79,7 +83,7 @@ export default function ComparisonPlot() {
               strokeDasharray="3,3"
             />
           ))}
-          {[50000, 100000, 150000, 200000].map((q) => (
+          {[25000, 50000, 75000, 100000].map((q) => (
             <line
               key={q}
               x1={pad.left}
@@ -92,14 +96,14 @@ export default function ComparisonPlot() {
           ))}
 
           {/* Axes labels */}
-          <text x={toX(0.80)} y={height - 12} fill="#64748b" textAnchor="start">0.80</text>
-          <text x={toX(0.90)} y={height - 12} fill="#64748b" textAnchor="middle">0.90</text>
+          <text x={toX(0.30)} y={height - 12} fill="#64748b" textAnchor="start">0.30</text>
+          <text x={toX(0.65)} y={height - 12} fill="#64748b" textAnchor="middle">0.65</text>
           <text x={toX(1.00)} y={height - 12} fill="#64748b" textAnchor="end">1.00</text>
 
+          <text x={pad.left - 6} y={toY(25000)} fill="#64748b" textAnchor="end" dominantBaseline="middle">25k</text>
           <text x={pad.left - 6} y={toY(50000)} fill="#64748b" textAnchor="end" dominantBaseline="middle">50k</text>
+          <text x={pad.left - 6} y={toY(75000)} fill="#64748b" textAnchor="end" dominantBaseline="middle">75k</text>
           <text x={pad.left - 6} y={toY(100000)} fill="#64748b" textAnchor="end" dominantBaseline="middle">100k</text>
-          <text x={pad.left - 6} y={toY(150000)} fill="#64748b" textAnchor="end" dominantBaseline="middle">150k</text>
-          <text x={pad.left - 6} y={toY(200000)} fill="#64748b" textAnchor="end" dominantBaseline="middle">200k</text>
 
           {/* HNSWLib (CPU) Line */}
           <path d={makePath(hnswLibCpuData)} fill="none" stroke="#64748b" strokeWidth="2" />
@@ -107,21 +111,21 @@ export default function ComparisonPlot() {
             <circle key={i} cx={toX(d.recall)} cy={toY(d.qps)} r="3" fill="#64748b" />
           ))}
 
-          {/* Faiss-GPU Line */}
-          <path d={makePath(faissGpuData)} fill="none" stroke="#a855f7" strokeWidth="2" />
-          {faissGpuData.map((d, i) => (
+          {/* FlashVector-GPU IVF-PQ Line */}
+          <path d={makePath(flashVectorIvfPqData)} fill="none" stroke="#a855f7" strokeWidth="2" />
+          {flashVectorIvfPqData.map((d, i) => (
             <circle key={i} cx={toX(d.recall)} cy={toY(d.qps)} r="3" fill="#a855f7" />
           ))}
 
-          {/* FlashVector-GPU Line */}
+          {/* FlashVector-GPU HNSW Line */}
           <path
-            d={makePath(flashVectorData)}
+            d={makePath(flashVectorHnswData)}
             fill="none"
             stroke="#00f0ff"
             strokeWidth="3"
             className="drop-shadow-[0_0_8px_#00f0ff]"
           />
-          {flashVectorData.map((d, i) => (
+          {flashVectorHnswData.map((d, i) => (
             <circle
               key={i}
               cx={toX(d.recall)}
@@ -139,11 +143,11 @@ export default function ComparisonPlot() {
       <div className="grid grid-cols-3 gap-2 text-[11px] font-mono">
         <div className="flex items-center gap-1.5 text-primary">
           <span className="w-2.5 h-2.5 rounded-full bg-primary shadow-glow" />
-          <span>FlashVector-GPU</span>
+          <span>FlashVector HNSW</span>
         </div>
         <div className="flex items-center gap-1.5 text-purple-400">
           <span className="w-2.5 h-2.5 rounded-full bg-purple-500" />
-          <span>Faiss-GPU</span>
+          <span>FlashVector IVF-PQ</span>
         </div>
         <div className="flex items-center gap-1.5 text-slate-400">
           <span className="w-2.5 h-2.5 rounded-full bg-slate-500" />
