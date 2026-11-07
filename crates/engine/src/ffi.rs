@@ -1,3 +1,9 @@
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
+// The functions below form the safe wrapper layer over the CUDA C FFI. Their
+// raw-pointer parameters are opaque CUDA handles and device addresses that are
+// only ever forwarded to the C ABI, never dereferenced in Rust, so they are not
+// exposed as `unsafe fn`; validity is a documented precondition of the callers.
+
 use thiserror::Error;
 
 #[derive(Error, Debug, Clone, PartialEq, Eq)]

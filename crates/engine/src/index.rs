@@ -1,4 +1,3 @@
-use rayon::prelude::*;
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::info;
@@ -11,17 +10,6 @@ use crate::ffi::{
 use crate::memory::{DeviceBuffer, PinnedBuffer};
 use crate::metrics::MetricsTracker;
 use crate::streams::{CudaStreamPool, MAX_BATCH_SIZE, MAX_HOPS, MAX_SUPPORTED_DIM, MAX_TOP_K};
-
-#[inline]
-fn l2_sq(a: &[f32], b: &[f32]) -> f32 {
-    a.iter()
-        .zip(b.iter())
-        .map(|(&x, &y)| {
-            let d = x - y;
-            d * d
-        })
-        .sum()
-}
 
 #[inline]
 fn normalize_slice_in_place(values: &mut [f32], dim: usize) {
@@ -174,107 +162,17 @@ impl GpuVectorIndex {
         let stream = self.streams.get_stream();
         d_vecs.copy_from_pinned_async(&raw_pinned, stream.raw())?;
 
-        // 2. Build the HNSW graph using Malkov-Yashunin diverse neighbor selection.
+        // 2. Build the HNSW graph by incremental insertion with beam search and
+        // Malkov-Yashunin diverse neighbor selection.
         let m = self.config.m as usize;
         let ef_construction = self.config.ef_construction as usize;
-        let mut h_adj = PinnedBuffer::new(num_vectors * m)?;
-        let mut h_deg = PinnedBuffer::new(num_vectors)?;
+        let (adjacency, degrees, best_node) =
+            crate::graph::build_hnsw(dataset, num_vectors, dim, m, ef_construction);
 
-        let adj_chunks: Vec<(usize, Vec<u32>)> = (0..num_vectors)
-            .into_par_iter()
-            .map(|i| {
-                let vi = &dataset[i * dim..(i + 1) * dim];
-                let mut rng = rand::thread_rng();
-
-                let sample_size = ef_construction.min(num_vectors.saturating_sub(1));
-                let mut candidate_set = std::collections::HashSet::with_capacity(sample_size + m);
-                while candidate_set.len() < sample_size {
-                    let r = rand::Rng::gen_range(&mut rng, 0..num_vectors);
-                    if r != i {
-                        candidate_set.insert(r);
-                    }
-                }
-                for offset in 1..=(m / 2).max(1) {
-                    let forward = (i + offset) % num_vectors;
-                    let backward = (i + num_vectors - offset) % num_vectors;
-                    if forward != i {
-                        candidate_set.insert(forward);
-                    }
-                    if backward != i {
-                        candidate_set.insert(backward);
-                    }
-                }
-
-                let mut scored: Vec<(u32, f32)> = candidate_set
-                    .into_iter()
-                    .map(|cand_id| {
-                        let vj = &dataset[cand_id * dim..(cand_id + 1) * dim];
-                        (cand_id as u32, l2_sq(vi, vj))
-                    })
-                    .collect();
-                scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-
-                // HNSW heuristic: keep a candidate only if it is closer to the base
-                // node than to every neighbor selected so far. This preserves the
-                // long-range edges that keep greedy beam search from getting trapped.
-                let mut selected: Vec<(u32, f32)> = Vec::with_capacity(m);
-                for &(cand_id, cand_dist) in &scored {
-                    if selected.len() >= m {
-                        break;
-                    }
-                    let cand_vec = &dataset[cand_id as usize * dim..(cand_id as usize + 1) * dim];
-                    let mut is_good = true;
-                    for &(sel_id, _) in &selected {
-                        let sel_vec = &dataset[sel_id as usize * dim..(sel_id as usize + 1) * dim];
-                        if l2_sq(cand_vec, sel_vec) < cand_dist {
-                            is_good = false;
-                            break;
-                        }
-                    }
-                    if is_good {
-                        selected.push((cand_id, cand_dist));
-                    }
-                }
-
-                // Fill any slots pruned by the heuristic with the nearest remaining
-                // candidates so every node keeps up to `m` outgoing edges.
-                if selected.len() < m {
-                    for &(cand_id, cand_dist) in &scored {
-                        if selected.len() >= m {
-                            break;
-                        }
-                        if !selected.iter().any(|(id, _)| *id == cand_id) {
-                            selected.push((cand_id, cand_dist));
-                        }
-                    }
-                }
-
-                let mut row = vec![0xFFFFFFFFu32; m];
-                let deg = selected.len().min(m);
-                for (k, (id, _)) in selected.iter().take(deg).enumerate() {
-                    row[k] = *id;
-                }
-                (deg, row)
-            })
-            .collect();
-
-        for (i, (deg, row)) in adj_chunks.into_iter().enumerate() {
-            h_deg[i] = deg as u32;
-            for k in 0..m {
-                h_adj[i * m + k] = row[k];
-            }
-        }
-
-        // The highest-degree node is the most connected hub and is the best
-        // entry point for greedy descent.
-        let mut best_node = 0u32;
-        let mut best_degree = 0u32;
-        for i in 0..num_vectors {
-            if h_deg[i] > best_degree {
-                best_degree = h_deg[i];
-                best_node = i as u32;
-            }
-        }
+        let mut h_adj = PinnedBuffer::new(adjacency.len())?;
+        h_adj.copy_from_slice(&adjacency);
+        let mut h_deg = PinnedBuffer::new(degrees.len())?;
+        h_deg.copy_from_slice(&degrees);
 
         let mut d_adj = DeviceBuffer::new(num_vectors * m)?;
         let mut d_deg = DeviceBuffer::new(num_vectors)?;

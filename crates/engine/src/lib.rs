@@ -2,6 +2,7 @@ pub mod ffi;
 pub mod memory;
 pub mod streams;
 pub mod cluster;
+pub mod graph;
 pub mod metrics;
 pub mod index;
 

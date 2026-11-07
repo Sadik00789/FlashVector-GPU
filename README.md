@@ -130,14 +130,35 @@ Graph construction uses the HNSW diversity heuristic rather than plain k-nearest
 
 ---
 
-## Benchmark Results (RTX 3050, `sm_86`, SIFT1M)
+## Benchmark Results (RTX 3050 Laptop, `sm_86`, SIFT1M)
+
+Full SIFT1M (1,000,000 × 128-D), scored against the ann-benchmarks ground truth with 1,000 queries and `k = 10`. FlashVector-GPU was built with `m = 32`, `ef_construction = 128`, `nlist = 256`, `m_pq = 16` on CUDA 13.5; the index build takes 390 s. QPS is the best of five repetitions of a single batched dispatch over all 1,000 queries.
 
 | Engine | Index Type | Recall@10 | QPS (queries/sec) | Mean Latency |
 | :--- | :--- | :---: | :---: | :---: |
-| **FlashVector-GPU** | **Warp HNSW (`sm_86`)** | **0.985** | **64,200** | **15.5 µs** |
-| **FlashVector-GPU** | **IVF-PQ ADC (`sm_86`)** | **0.940** | **148,000** | **6.7 µs** |
-| Meta Faiss-GPU | IVF-PQ (CUDA) | 0.930 | 45,000 | 22.2 µs |
-| HNSWLib | CPU (AVX-512) | 0.985 | 6,200 | 161.2 µs |
+| **FlashVector-GPU** | **Warp HNSW (`efSearch = 128`)** | **0.9848** | **15,719** | **63.6 µs** |
+| **FlashVector-GPU** | **Warp HNSW (`efSearch = 256`)** | **0.9958** | **5,629** | **177.6 µs** |
+| **FlashVector-GPU** | **IVF-PQ ADC (`nprobe = 8`)** | **0.5269** | **22,697** | **44.1 µs** |
+| **FlashVector-GPU** | **IVF-PQ ADC (`nprobe = 1`)** | **0.3520** | **83,062** | **12.0 µs** |
+| HNSWLib | CPU, 12 threads (`efSearch = 64`) | 0.9800 | 13,413 | 74.6 µs |
+
+The full search-parameter sweep for both FlashVector-GPU engines:
+
+| Engine | Search parameter | Recall@10 | QPS | Mean Latency |
+| :--- | :--- | :---: | :---: | :---: |
+| HNSW | `efSearch = 16` | 0.7568 | 93,686 | 10.7 µs |
+| HNSW | `efSearch = 32` | 0.8767 | 51,229 | 19.5 µs |
+| HNSW | `efSearch = 64` | 0.9511 | 38,338 | 26.1 µs |
+| HNSW | `efSearch = 128` | 0.9848 | 15,719 | 63.6 µs |
+| HNSW | `efSearch = 256` | 0.9958 | 5,629 | 177.6 µs |
+| IVF-PQ | `nprobe = 1` | 0.3520 | 83,062 | 12.0 µs |
+| IVF-PQ | `nprobe = 4` | 0.4960 | 34,657 | 28.9 µs |
+| IVF-PQ | `nprobe = 8` | 0.5269 | 22,697 | 44.1 µs |
+| IVF-PQ | `nprobe = 16` | 0.5382 | 14,906 | 67.1 µs |
+| IVF-PQ | `nprobe = 32` | 0.5422 | 9,522 | 105.0 µs |
+| IVF-PQ | `nprobe = 64` | 0.5420 | 5,800 | 172.4 µs |
+
+IVF-PQ throughput scales with the number of probed lists, while recall saturates near 0.54 beyond `nprobe = 16`: at that point the residual error is quantization from the 8-bit, 16-sub-quantizer codebook rather than missing candidates. Widening the codebook raises the ceiling at the cost of memory and build time. A Meta Faiss-GPU comparison is not included because no `faiss` build is available for the Python 3.15 toolchain used for these runs.
 
 ---
 
@@ -214,7 +235,7 @@ python -m pytest python/tests -v
 bash scripts/check_sanitizer.sh
 ```
 
-The current tree was validated on an NVIDIA RTX 3050 Laptop (`sm_86`) with CUDA 13.5: 4/4 CUDA sanity tests, 2/2 end-to-end tests (Recall@10 = 0.992 on a 5,000-vector synthetic dataset), 7/7 Python binding tests, and REST snapshot/search plus WebSocket streaming smoke tests. `compute-sanitizer` ships with the full CUDA Toolkit and is not included in the PyPI compiler/runtime packages; on Windows it also requires the WDDM debugger interface to be enabled by running `EnableDebuggerInterface.bat` as Administrator.
+The current tree was validated on an NVIDIA RTX 3050 Laptop (`sm_86`) with CUDA 13.5: 4/4 CUDA sanity tests, 2/2 end-to-end tests (Recall@10 = 1.0000 on a 5,000-vector synthetic dataset), 7/7 Python binding tests, and REST snapshot/search plus WebSocket streaming smoke tests. `compute-sanitizer` ships with the full CUDA Toolkit and is not included in the PyPI compiler/runtime packages; on Windows it also requires the WDDM debugger interface to be enabled by running `EnableDebuggerInterface.bat` as Administrator.
 
 ---
 

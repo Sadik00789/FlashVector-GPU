@@ -16,7 +16,7 @@ fn test_pinned_device_memory_transfers() {
     init_gpu(0).unwrap();
     let stream = engine::CudaStream::new(0).unwrap();
 
-    let data = vec![1.0f32, 2.5, -3.14, 42.0, 100.5];
+    let data = vec![1.0f32, 2.5, -3.15, 42.0, 100.5];
     let h_buf = PinnedBuffer::from_slice(&data).unwrap();
     let mut d_buf = DeviceBuffer::new(data.len()).unwrap();
     let mut h_out = PinnedBuffer::new(data.len()).unwrap();
@@ -95,7 +95,7 @@ fn test_bitonic_sort_correctness() {
     init_gpu(0).unwrap();
     let stream = engine::CudaStream::new(0).unwrap();
 
-    let keys_in = vec![45.2f32, 1.2, 99.0, 3.14, 0.5, 12.8, 88.3, 7.7];
+    let keys_in = vec![45.2f32, 1.2, 99.0, 3.15, 0.5, 12.8, 88.3, 7.7];
     let vals_in = vec![0u32, 1, 2, 3, 4, 5, 6, 7];
 
     let mut d_k_in = DeviceBuffer::new(keys_in.len()).unwrap();
