@@ -11,20 +11,19 @@ def plot_pareto_frontier(output_path="pareto_frontier.png"):
     # against the ann-benchmarks ground truth with 1,000 queries, on an
     # NVIDIA RTX 3050 Laptop (sm_86). See the README benchmark section.
     flashvector_hnsw = [
-        (0.7568, 93686),
-        (0.8767, 51229),
-        (0.9511, 38338),
-        (0.9848, 15719),
-        (0.9958, 5629),
+        (0.7568, 19723),
+        (0.8767, 51070),
+        (0.9511, 38243),
+        (0.9848, 15670),
+        (0.9958, 5631),
     ]
 
     flashvector_ivf_pq = [
-        (0.3520, 83062),
-        (0.4960, 34657),
-        (0.5269, 22697),
-        (0.5382, 14906),
-        (0.5422, 9522),
-        (0.5420, 5800),
+        (0.4610, 18790),
+        (0.7454, 4265),
+        (0.8166, 3089),
+        (0.8454, 2499),
+        (0.8504, 2151),
     ]
 
     hnswlib_cpu = [
@@ -41,7 +40,7 @@ def plot_pareto_frontier(output_path="pareto_frontier.png"):
 
     # Plot FlashVector-GPU IVF-PQ
     r_pq, q_pq = zip(*flashvector_ivf_pq)
-    plt.plot(r_pq, q_pq, 'D--', color='#a855f7', linewidth=2, markersize=6, label='FlashVector-GPU IVF-PQ (Ampere sm_86)')
+    plt.plot(r_pq, q_pq, 'D--', color='#a855f7', linewidth=2, markersize=6, label='FlashVector-GPU IVF-PQ + rerank (Ampere sm_86)')
 
     # Plot HNSWLib (CPU)
     r_hnsw, q_hnsw = zip(*hnswlib_cpu)
@@ -53,8 +52,8 @@ def plot_pareto_frontier(output_path="pareto_frontier.png"):
     plt.grid(True, linestyle='--', alpha=0.3)
     plt.legend(frameon=True, facecolor='#0f1118', edgecolor='#1e2230', fontsize=10)
 
-    plt.xlim(0.30, 1.00)
-    plt.ylim(0, 100000)
+    plt.xlim(0.35, 1.00)
+    plt.ylim(0, 60000)
 
     plt.tight_layout()
     plt.savefig(output_path)

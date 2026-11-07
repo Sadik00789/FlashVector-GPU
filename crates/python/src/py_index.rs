@@ -40,7 +40,6 @@ impl FlashVectorGPU {
             ef_construction,
             nlist,
             m_pq,
-            nbits_pq: 8,
             metric: metric_enum as u32,
         };
 
@@ -174,14 +173,15 @@ impl FlashVectorGPU {
         Ok((labels_2d.into(), dists_2d.into()))
     }
 
-    /// Batched GPU IVF-PQ ADC search across all queries in a single CUDA grid launch
-    #[pyo3(signature = (query, top_k=10, nprobe=8))]
+    /// Batched GPU IVF-PQ ADC search with exact re-ranking across all queries
+    #[pyo3(signature = (query, top_k=10, nprobe=8, rerank_k=32))]
     pub fn search_ivf(
         &self,
         py: Python<'_>,
         query: &Bound<'_, PyAny>,
         top_k: usize,
         nprobe: usize,
+        rerank_k: usize,
     ) -> PyResult<(PyObject, PyObject)> {
         let view = TensorView::from_pyany(query)?;
         if view.dim != self.dim {
@@ -200,7 +200,7 @@ impl FlashVectorGPU {
 
         let idx = self.inner.read();
         let results = if view.is_cuda {
-            idx.batch_search_ivf_device_ptr(view.ptr, view.num_vectors, top_k, nprobe)
+            idx.batch_search_ivf_device_ptr(view.ptr, view.num_vectors, top_k, nprobe, rerank_k)
                 .map_err(|e| {
                     pyo3::exceptions::PyRuntimeError::new_err(format!(
                         "Batch IVF search error: {:?}",
@@ -213,7 +213,7 @@ impl FlashVectorGPU {
             // for the duration of this call.
             let slice =
                 unsafe { std::slice::from_raw_parts(view.ptr, view.num_vectors * view.dim) };
-            idx.batch_search_ivf(slice, view.num_vectors, top_k, nprobe)
+            idx.batch_search_ivf(slice, view.num_vectors, top_k, nprobe, rerank_k)
                 .map_err(|e| {
                     pyo3::exceptions::PyRuntimeError::new_err(format!(
                         "Batch IVF search error: {:?}",

@@ -57,7 +57,6 @@ typedef struct {
     uint32_t ef_construction; // Construction beam width (e.g. 100, 200)
     uint32_t nlist;           // IVF Voronoi centroids (e.g. 256, 1024)
     uint32_t m_pq;            // Product quantization sub-vector partitions (e.g. 8, 16, 32)
-    uint32_t nbits_pq;        // Bits per sub-quantizer (typically 8 for 256 centroids)
     uint32_t metric;          // 0: L2, 1: Cosine, 2: Inner Product
 } IndexConfig;
 
@@ -68,6 +67,7 @@ typedef struct {
     const uint8_t* d_pq_codes;      // [num_vectors * m_pq] Quantized subvector codes
     const uint32_t* d_ivf_offsets;  // [nlist + 1] Prefix sum offsets for IVF lists
     const uint32_t* d_ivf_vec_ids;  // [num_vectors] Vector IDs in IVF posting lists
+    const float* d_vectors;         // [num_vectors * dim] Full-precision vectors for re-ranking
     uint32_t num_vectors;
     uint32_t dim;
     uint32_t nlist;

@@ -132,33 +132,41 @@ Graph construction uses the HNSW diversity heuristic rather than plain k-nearest
 
 ## Benchmark Results (RTX 3050 Laptop, `sm_86`, SIFT1M)
 
-Full SIFT1M (1,000,000 × 128-D), scored against the ann-benchmarks ground truth with 1,000 queries and `k = 10`. FlashVector-GPU was built with `m = 32`, `ef_construction = 128`, `nlist = 256`, `m_pq = 16` on CUDA 13.5; the index build takes 390 s. QPS is the best of five repetitions of a single batched dispatch over all 1,000 queries.
+Full SIFT1M (1,000,000 × 128-D), scored against the ann-benchmarks ground truth with 1,000 queries and `k = 10`. FlashVector-GPU was built with `m = 32`, `ef_construction = 128`, `nlist = 256`, `m_pq = 16` on CUDA 13.5; the index build takes 570 s. QPS is the best of five repetitions of a single batched dispatch over all 1,000 queries.
 
 | Engine | Index Type | Recall@10 | QPS (queries/sec) | Mean Latency |
 | :--- | :--- | :---: | :---: | :---: |
-| **FlashVector-GPU** | **Warp HNSW (`efSearch = 128`)** | **0.9848** | **15,719** | **63.6 µs** |
-| **FlashVector-GPU** | **Warp HNSW (`efSearch = 256`)** | **0.9958** | **5,629** | **177.6 µs** |
-| **FlashVector-GPU** | **IVF-PQ ADC (`nprobe = 8`)** | **0.5269** | **22,697** | **44.1 µs** |
-| **FlashVector-GPU** | **IVF-PQ ADC (`nprobe = 1`)** | **0.3520** | **83,062** | **12.0 µs** |
+| **FlashVector-GPU** | **Warp HNSW (`efSearch = 128`)** | **0.9848** | **15,670** | **63.8 µs** |
+| **FlashVector-GPU** | **Warp HNSW (`efSearch = 256`)** | **0.9958** | **5,631** | **177.6 µs** |
+| **FlashVector-GPU** | **IVF-PQ ADC + rerank (`nprobe = 32`)** | **0.8504** | **2,151** | **465.0 µs** |
+| **FlashVector-GPU** | **IVF-PQ ADC + rerank (`nprobe = 4`)** | **0.7454** | **4,265** | **234.5 µs** |
 | HNSWLib | CPU, 12 threads (`efSearch = 64`) | 0.9800 | 13,413 | 74.6 µs |
 
 The full search-parameter sweep for both FlashVector-GPU engines:
 
 | Engine | Search parameter | Recall@10 | QPS | Mean Latency |
 | :--- | :--- | :---: | :---: | :---: |
-| HNSW | `efSearch = 16` | 0.7568 | 93,686 | 10.7 µs |
-| HNSW | `efSearch = 32` | 0.8767 | 51,229 | 19.5 µs |
-| HNSW | `efSearch = 64` | 0.9511 | 38,338 | 26.1 µs |
-| HNSW | `efSearch = 128` | 0.9848 | 15,719 | 63.6 µs |
-| HNSW | `efSearch = 256` | 0.9958 | 5,629 | 177.6 µs |
-| IVF-PQ | `nprobe = 1` | 0.3520 | 83,062 | 12.0 µs |
-| IVF-PQ | `nprobe = 4` | 0.4960 | 34,657 | 28.9 µs |
-| IVF-PQ | `nprobe = 8` | 0.5269 | 22,697 | 44.1 µs |
-| IVF-PQ | `nprobe = 16` | 0.5382 | 14,906 | 67.1 µs |
-| IVF-PQ | `nprobe = 32` | 0.5422 | 9,522 | 105.0 µs |
-| IVF-PQ | `nprobe = 64` | 0.5420 | 5,800 | 172.4 µs |
+| HNSW | `efSearch = 16` | 0.7568 | 19,723 | 50.7 µs |
+| HNSW | `efSearch = 32` | 0.8767 | 51,070 | 19.6 µs |
+| HNSW | `efSearch = 64` | 0.9511 | 38,243 | 26.1 µs |
+| HNSW | `efSearch = 128` | 0.9848 | 15,670 | 63.8 µs |
+| HNSW | `efSearch = 256` | 0.9958 | 5,631 | 177.6 µs |
+| IVF-PQ | `nprobe = 1`, rerank 32 | 0.4610 | 18,790 | 53.2 µs |
+| IVF-PQ | `nprobe = 4`, rerank 32 | 0.7454 | 4,265 | 234.5 µs |
+| IVF-PQ | `nprobe = 8`, rerank 32 | 0.8166 | 3,089 | 323.8 µs |
+| IVF-PQ | `nprobe = 16`, rerank 32 | 0.8454 | 2,499 | 400.1 µs |
+| IVF-PQ | `nprobe = 32`, rerank 32 | 0.8504 | 2,151 | 465.0 µs |
 
-IVF-PQ throughput scales with the number of probed lists, while recall saturates near 0.54 beyond `nprobe = 16`: at that point the residual error is quantization from the 8-bit, 16-sub-quantizer codebook rather than missing candidates. Widening the codebook raises the ceiling at the cost of memory and build time.
+Codes are trained on residuals `x − centroid(x)` and every query re-scores its shortlist against the full-precision vectors, so reported distances are exact rather than quantized. The rerank shortlist is the dominant cost; recall and throughput trade off directly with it at `nprobe = 8`:
+
+| Rerank shortlist | Recall@10 | QPS | Mean Latency |
+| :--- | :---: | :---: | :---: |
+| 1 (ADC only) | 0.5401 | 21,572 | 46.4 µs |
+| 8 | 0.5401 | 20,907 | 47.8 µs |
+| 16 | 0.6645 | 11,046 | 90.5 µs |
+| 32 | 0.8166 | 3,089 | 323.8 µs |
+
+On this GPU the HNSW engine dominates IVF-PQ across the frontier, reaching 0.9848 recall at roughly two orders of magnitude the throughput of the best IVF-PQ point. IVF-PQ remains useful where codes must be stored compactly or the full vector set cannot be held resident.
 
 ---
 
@@ -259,8 +267,11 @@ labels, distances = index.search(query, top_k=10, ef_search=64)
 print(labels.shape)      # (10, 10)
 print(distances.shape)   # (10, 10)
 
-ivf_labels, ivf_distances = index.search_ivf(query, top_k=10, nprobe=8)
+ivf_labels, ivf_distances = index.search_ivf(query, top_k=10, nprobe=8, rerank_k=32)
+print(ivf_distances.shape)  # (10, 10); distances are exact, not quantized
 ```
+
+`rerank_k` is the shortlist size re-scored against full-precision vectors; pass `rerank_k=1` to skip re-ranking and read quantized ADC distances instead. Larger shortlists raise recall and cost throughput roughly linearly.
 
 ---
 

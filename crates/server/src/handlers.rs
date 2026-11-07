@@ -186,7 +186,6 @@ pub async fn handle_load_snapshot(
         ef_construction: 128,
         nlist: num_vectors.min(32) as u32,
         m_pq: choose_m_pq(dim),
-        nbits_pq: 8,
         metric: 0,
     };
 

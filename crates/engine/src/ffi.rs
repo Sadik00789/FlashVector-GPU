@@ -79,7 +79,6 @@ pub struct IndexConfig {
     pub ef_construction: u32,
     pub nlist: u32,
     pub m_pq: u32,
-    pub nbits_pq: u32,
     pub metric: u32,
 }
 
@@ -92,7 +91,6 @@ impl Default for IndexConfig {
             ef_construction: 128,
             nlist: 256,
             m_pq: 16,
-            nbits_pq: 8,
             metric: MetricType::L2 as u32,
         }
     }
@@ -105,6 +103,7 @@ pub struct IvfPqGpuTables {
     pub d_pq_codes: *const u8,
     pub d_ivf_offsets: *const u32,
     pub d_ivf_vec_ids: *const u32,
+    pub d_vectors: *const f32,
     pub num_vectors: u32,
     pub dim: u32,
     pub nlist: u32,
@@ -161,6 +160,7 @@ extern "C" {
         num_queries: u32,
         top_k: u32,
         nprobe: u32,
+        rerank_k: u32,
         metric: MetricType,
         d_out_results: *mut GpuSearchResult,
         stream: *mut libc::c_void,
@@ -392,6 +392,7 @@ pub fn gpu_ivf_pq_search_batch(
     num_queries: u32,
     top_k: u32,
     nprobe: u32,
+    rerank_k: u32,
     metric: MetricType,
     d_out_results: *mut GpuSearchResult,
     stream: *mut libc::c_void,
@@ -403,6 +404,7 @@ pub fn gpu_ivf_pq_search_batch(
             num_queries,
             top_k,
             nprobe,
+            rerank_k,
             metric,
             d_out_results,
             stream,

@@ -24,7 +24,6 @@ impl AppState {
             ef_construction: 128,
             nlist: 32,
             m_pq: 16,
-            nbits_pq: 8,
             metric: 0,
         };
 

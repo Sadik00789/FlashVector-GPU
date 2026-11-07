@@ -31,7 +31,6 @@ fn test_e2e_hnsw_recall_target() {
         ef_construction: 200,
         nlist: 32,
         m_pq: 16,
-        nbits_pq: 8,
         metric: 0,
     };
 
@@ -97,7 +96,6 @@ fn test_device_pointer_zero_copy_search() {
         ef_construction: 64,
         nlist: 16,
         m_pq: 8,
-        nbits_pq: 8,
         metric: 0,
     };
     let mut index = GpuVectorIndex::new(config).expect("Index init failed");
@@ -128,10 +126,10 @@ fn test_device_pointer_zero_copy_search() {
     }
 
     let host_ivf = index
-        .batch_search_ivf(&queries[..dim], 1, top_k, 8)
+        .batch_search_ivf(&queries[..dim], 1, top_k, 8, 0)
         .expect("Host IVF search failed");
     let device_ivf = index
-        .batch_search_ivf_device_ptr(d_queries.as_ptr(), 1, top_k, 8)
+        .batch_search_ivf_device_ptr(d_queries.as_ptr(), 1, top_k, 8, 0)
         .expect("Device pointer IVF search failed");
 
     assert_eq!(host_ivf.len(), device_ivf.len());

@@ -49,6 +49,7 @@ int cuda_ivf_pq_search_batch(
     uint32_t num_queries,
     uint32_t top_k,
     uint32_t nprobe,
+    uint32_t rerank_k,
     MetricType metric,
     GpuSearchResult* d_out_results,
     void* stream

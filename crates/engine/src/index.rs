@@ -1,3 +1,4 @@
+use rayon::prelude::*;
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::info;
@@ -185,9 +186,27 @@ impl GpuVectorIndex {
         assert!(m_pq > 0, "m_pq must be greater than zero");
         assert!(dim % m_pq == 0, "Dimension must be divisible by m_pq");
 
-        let kmeans_res = KMeans::fit(dataset, dim, nlist, 10);
-        let pq = ProductQuantizer::train(dataset, dim, m_pq, 8);
-        let codes = pq.encode(dataset);
+        let kmeans_res = KMeans::fit(dataset, dim, nlist, 25);
+
+        // Product quantization is trained on residuals x - centroid(x) rather
+        // than on raw vectors. The codes then only model variation within a
+        // Voronoi cell instead of the global distribution, which is what makes
+        // the coarse quantizer and the PQ work together.
+        let mut residuals = vec![0.0f32; dataset.len()];
+        residuals
+            .par_chunks_exact_mut(dim)
+            .enumerate()
+            .for_each(|(vec_id, dst)| {
+                let cluster = kmeans_res.assignments[vec_id] as usize;
+                let centroid = &kmeans_res.centroids[cluster * dim..(cluster + 1) * dim];
+                let vector = &dataset[vec_id * dim..(vec_id + 1) * dim];
+                for d in 0..dim {
+                    dst[d] = vector[d] - centroid[d];
+                }
+            });
+
+        let pq = ProductQuantizer::train(&residuals, dim, m_pq, 25);
+        let codes = pq.encode(&residuals);
 
         // Build Inverted Posting Lists
         let mut cluster_lists: Vec<Vec<u32>> = vec![Vec::new(); nlist];
@@ -498,13 +517,17 @@ impl GpuVectorIndex {
         Ok(h_results)
     }
 
-    /// Batched IVF-PQ ADC search in a single CUDA grid launch
+    /// Batched IVF-PQ ADC search in a single CUDA grid launch.
+    ///
+    /// `rerank_k` is the shortlist size re-scored with exact distances; pass 0
+    /// to use the default. The shortlist is clamped to `top_k` at minimum.
     pub fn batch_search_ivf(
         &self,
         queries: &[f32],
         num_queries: usize,
         top_k: usize,
         nprobe: usize,
+        rerank_k: usize,
     ) -> Result<Vec<GpuSearchResult>, CudaError> {
         assert!(self.is_built, "Index must be built before searching");
         if num_queries == 0 || top_k == 0 {
@@ -544,6 +567,7 @@ impl GpuVectorIndex {
             d_pq_codes: self.d_codes.as_ptr(),
             d_ivf_offsets: self.d_ivf_offsets.as_ptr(),
             d_ivf_vec_ids: self.d_ivf_vec_ids.as_ptr(),
+            d_vectors: self.d_vectors.as_ptr(),
             num_vectors: self.num_vectors as u32,
             dim: self.config.dim,
             nlist: (self.h_centroids.len() / dim) as u32,
@@ -557,6 +581,7 @@ impl GpuVectorIndex {
             num_queries as u32,
             top_k as u32,
             nprobe as u32,
+            rerank_k as u32,
             self.metric(),
             d_results.as_mut_ptr(),
             stream.raw(),
@@ -578,6 +603,7 @@ impl GpuVectorIndex {
         num_queries: usize,
         top_k: usize,
         nprobe: usize,
+        rerank_k: usize,
     ) -> Result<Vec<GpuSearchResult>, CudaError> {
         assert!(self.is_built, "Index must be built before searching");
         if num_queries == 0 || top_k == 0 {
@@ -607,6 +633,7 @@ impl GpuVectorIndex {
             d_pq_codes: self.d_codes.as_ptr(),
             d_ivf_offsets: self.d_ivf_offsets.as_ptr(),
             d_ivf_vec_ids: self.d_ivf_vec_ids.as_ptr(),
+            d_vectors: self.d_vectors.as_ptr(),
             num_vectors: self.num_vectors as u32,
             dim: self.config.dim,
             nlist: (self.h_centroids.len() / dim) as u32,
@@ -620,6 +647,7 @@ impl GpuVectorIndex {
             num_queries as u32,
             top_k as u32,
             nprobe as u32,
+            rerank_k as u32,
             self.metric(),
             d_results.as_mut_ptr(),
             stream.raw(),
@@ -641,7 +669,7 @@ impl GpuVectorIndex {
         top_k: usize,
         nprobe: usize,
     ) -> Result<Vec<GpuSearchResult>, CudaError> {
-        self.batch_search_ivf(query, 1, top_k, nprobe)
+        self.batch_search_ivf(query, 1, top_k, nprobe, 0)
     }
 
     pub fn get_vector(&self, id: usize) -> Option<Vec<f32>> {
@@ -671,9 +699,10 @@ impl GpuVectorIndex {
 
     /// Compute per-cluster PQ reconstruction error from the trained codebooks.
     ///
-    /// Each vector is rebuilt from its `m_pq` codebook centroids and compared
-    /// against the stored representation. The reported error is the mean of
-    /// `||x - x_hat||^2 / ||x||^2`, sampled evenly across each inverted list.
+    /// Codes encode `x - centroid(x)`, so the reconstruction error is the
+    /// residual's quantization error measured against the centroid-relative
+    /// target. The reported value is the mean of `||r - r_hat||^2 / ||x||^2`,
+    /// sampled evenly across each inverted list.
     pub fn pq_distortion(&self, max_samples_per_cluster: usize) -> Vec<ClusterPqDistortion> {
         if !self.is_built || self.num_vectors == 0 {
             return Vec::new();
@@ -686,6 +715,7 @@ impl GpuVectorIndex {
         let sample_limit = max_samples_per_cluster.max(1);
 
         let vectors = self.raw_vectors.as_slice();
+        let centroids = self.h_centroids.as_slice();
         let codebooks = self.h_codebooks.as_slice();
         let codes = self.h_codes.as_slice();
         let offsets = self.h_ivf_offsets.as_slice();
@@ -705,6 +735,7 @@ impl GpuVectorIndex {
                     };
                 }
 
+                let centroid = &centroids[cluster_id * dim..(cluster_id + 1) * dim];
                 let stride = ((vector_count + sample_limit - 1) / sample_limit).max(1);
                 let mut error_sum = 0.0f64;
                 let mut sampled = 0usize;
@@ -719,9 +750,10 @@ impl GpuVectorIndex {
                     for m in 0..m_pq {
                         let code = codes[vec_id * m_pq + m] as usize;
                         let centroid_offset = (m * 256 + code) * sub_dim;
-                        let centroid = &codebooks[centroid_offset..centroid_offset + sub_dim];
+                        let cb = &codebooks[centroid_offset..centroid_offset + sub_dim];
                         for d in 0..sub_dim {
-                            let diff = vector[m * sub_dim + d] - centroid[d];
+                            let residual = vector[m * sub_dim + d] - centroid[m * sub_dim + d];
+                            let diff = residual - cb[d];
                             reconstruction_error += diff * diff;
                         }
                     }

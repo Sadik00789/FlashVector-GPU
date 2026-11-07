@@ -5,14 +5,23 @@ namespace flashvector {
 
 #define BLOCK_SIZE_IVF 128
 
-// Batched IVF-PQ ADC search kernel
-// Each thread block processes one query vector
+// Shortlist size for exact re-ranking, capped by the block-local collector.
+#define MAX_RERANK_CANDIDATES 32
+
+// Batched IVF-PQ ADC search kernel with residual codes and exact re-ranking.
+//
+// Each block handles one query. Stage 1 probes the nprobe nearest Voronoi
+// cells and ranks their PQ codes with asymmetric distance computation against
+// a per-cell residual lookup table. Stage 2 re-scores the shortlist with exact
+// distances against the full-precision vectors, which removes the quantization
+// bias that otherwise caps recall.
 __global__ void ivf_pq_adc_kernel(
     const float* __restrict__ d_centroids,
     const float* __restrict__ d_pq_codebooks,
     const uint8_t* __restrict__ d_pq_codes,
     const uint32_t* __restrict__ d_ivf_offsets,
     const uint32_t* __restrict__ d_ivf_vec_ids,
+    const float* __restrict__ d_vectors,
     uint32_t num_vectors,
     uint32_t dim,
     uint32_t nlist,
@@ -22,6 +31,7 @@ __global__ void ivf_pq_adc_kernel(
     uint32_t num_queries,
     uint32_t top_k,
     uint32_t nprobe,
+    uint32_t rerank_k,
     MetricType metric,
     GpuSearchResult* __restrict__ d_out_results
 ) {
@@ -34,10 +44,10 @@ __global__ void ivf_pq_adc_kernel(
     const float* query = &d_queries[query_idx * dim];
 
     // Dynamic shared memory layout:
-    // [0 .. m_pq * SMEM_PQ_STRIDE]: Distance Lookup Table (LUT)
+    // [0 .. m_pq * SMEM_PQ_STRIDE]: Residual Distance Lookup Table (LUT)
     // [offset .. offset + nprobe]: Probed centroid IDs
     // [offset .. offset + nprobe]: Probed centroid distances
-    // [aligned offset .. aligned offset + top_k]: Merged top-k results
+    // [aligned offset .. aligned offset + shortlist]: Merged results
     extern __shared__ float smem_pool[];
     float* smem_lut = smem_pool; // size: m_pq * 257
     uint32_t* smem_probed_clusters = (uint32_t*)&smem_lut[m_pq * SMEM_PQ_STRIDE];
@@ -64,7 +74,6 @@ __global__ void ivf_pq_adc_kernel(
     __syncthreads();
 
     // 1. Race-Free Coarse Quantization: Find closest nprobe Voronoi centroids
-    // Each thread tracks its local top candidates
     uint32_t local_probed_c[16];
     float local_probed_d[16];
     int local_probed_count = 0;
@@ -129,31 +138,39 @@ __global__ void ivf_pq_adc_kernel(
         __syncthreads();
     }
 
-    // 2. Build Asymmetric Distance Lookup Table (LUT) in Shared Memory with STRIDE 257
-    for (uint32_t m = 0; m < m_pq; ++m) {
-        for (uint32_t c = tid; c < 256; c += block_size) {
-            const float* q_sub = &query[m * sub_dim];
-            const float* cb_sub = &d_pq_codebooks[(m * 256 + c) * sub_dim];
-
-            float dist = 0.0f;
-            for (uint32_t sd = 0; sd < sub_dim; ++sd) {
-                float diff = q_sub[sd] - cb_sub[sd];
-                dist = fmaf(diff, diff, dist);
-            }
-            smem_lut[m * SMEM_PQ_STRIDE + c] = dist;
-        }
-    }
-    __syncthreads();
-
-    // 3. Scan assigned inverted lists and accumulate ADC distances.
+    // 2. Scan the probed inverted lists.
     // Keep the thread-local collector compact: a 256-entry list would spill
     // several kilobytes per thread to local memory and destroy throughput.
-    CandidateList<32> local_candidates;
-    local_candidates.init(top_k < 32 ? top_k : 32);
+    CandidateList<MAX_RERANK_CANDIDATES> local_candidates;
+    uint32_t shortlist = rerank_k == 0 ? 1u : rerank_k;
+    if (shortlist > MAX_RERANK_CANDIDATES) shortlist = MAX_RERANK_CANDIDATES;
+    if (shortlist < top_k) shortlist = top_k;
+    local_candidates.init((int)shortlist);
 
+    // Codes are trained on x - centroid(x), so each cell needs its own lookup
+    // table built against the residual q - centroid. One table per probed cell
+    // is rebuilt in place; a single table holding the minimum across cells
+    // would score every candidate against the wrong cell offset.
     for (uint32_t p = 0; p < nprobe; ++p) {
         uint32_t cluster_id = smem_probed_clusters[p];
         if (cluster_id >= nlist) continue;
+
+        // Build the residual LUT for this cell with 257-float stride, which
+        // keeps all 32 lanes on distinct shared-memory banks during the scan.
+        for (uint32_t m = 0; m < m_pq; ++m) {
+            for (uint32_t c = tid; c < 256; c += block_size) {
+                const float* cb_sub = &d_pq_codebooks[(m * 256 + c) * sub_dim];
+                const float* centroid_sub = &d_centroids[cluster_id * dim + m * sub_dim];
+
+                float dist = 0.0f;
+                for (uint32_t sd = 0; sd < sub_dim; ++sd) {
+                    float diff = (query[m * sub_dim + sd] - centroid_sub[sd]) - cb_sub[sd];
+                    dist = fmaf(diff, diff, dist);
+                }
+                smem_lut[m * SMEM_PQ_STRIDE + c] = dist;
+            }
+        }
+        __syncthreads();
 
         uint32_t list_start = d_ivf_offsets[cluster_id];
         uint32_t list_end = d_ivf_offsets[cluster_id + 1];
@@ -164,7 +181,7 @@ __global__ void ivf_pq_adc_kernel(
             uint32_t vec_id = d_ivf_vec_ids[vec_pos];
             const uint8_t* codes = &d_pq_codes[vec_id * m_pq];
 
-            // ADC Distance accumulation using 257-strided bank-conflict-free LUT
+            // ADC Distance accumulation using the 257-strided residual LUT
             float adc_dist = 0.0f;
             #pragma unroll 8
             for (uint32_t m = 0; m < m_pq; ++m) {
@@ -174,20 +191,66 @@ __global__ void ivf_pq_adc_kernel(
 
             local_candidates.insert(vec_id, adc_dist);
         }
+        __syncthreads();
     }
-    __syncthreads();
 
-    // 4. Block-wide parallel top-k reduction/merger across all 128 threads
-    block_bitonic_merge_topk<32>(
+    // 3. Block-wide parallel top-k reduction/merger across all 128 threads
+    block_bitonic_merge_topk<MAX_RERANK_CANDIDATES>(
         local_candidates,
         smem_merged_topk,
-        (int)top_k,
+        (int)shortlist,
         tid,
         block_size
     );
 
-    // Thread 0 writes merged top-k results to global memory
+    // 4. Exact re-ranking of the shortlist against the full-precision vectors.
+    //
+    // ADC ranks candidates on quantized codes; the error it introduces is what
+    // limits recall. Re-scoring the full shortlist with true distances lets a
+    // candidate that ADC ranked below top-k still be promoted into the result.
+    //
+    // Each warp owns one candidate so its reads are coalesced across 32 lanes;
+    // a thread-per-candidate mapping would issue scattered 512-byte reads and
+    // dominate the query latency.
+    int warp_id = tid / WARP_SIZE;
+    int lane_id = tid % WARP_SIZE;
+    int warps_per_block = block_size / WARP_SIZE;
+
+    for (uint32_t k = (uint32_t)warp_id; k < shortlist; k += (uint32_t)warps_per_block) {
+        uint32_t vec_id = smem_merged_topk[k].id;
+        if (vec_id >= num_vectors) continue;
+
+        float dist = warp_compute_distance(
+            query,
+            &d_vectors[vec_id * dim],
+            (int)dim,
+            lane_id,
+            metric
+        );
+        if (lane_id == 0) {
+            smem_merged_topk[k].distance = dist;
+        }
+    }
+    __syncthreads();
+
+    // 5. Re-sort the re-scored shortlist and emit the top-k.
+    // The shortlist is at most 32 entries, so a single pass of selection sort
+    // is cheaper than another bitonic network.
     if (tid == 0) {
+        for (uint32_t i = 0; i < shortlist; ++i) {
+            uint32_t best = i;
+            for (uint32_t j = i + 1; j < shortlist; ++j) {
+                if (smem_merged_topk[j].distance < smem_merged_topk[best].distance) {
+                    best = j;
+                }
+            }
+            if (best != i) {
+                GpuSearchResult tmp = smem_merged_topk[i];
+                smem_merged_topk[i] = smem_merged_topk[best];
+                smem_merged_topk[best] = tmp;
+            }
+        }
+
         uint32_t out_base = query_idx * top_k;
         for (uint32_t k = 0; k < top_k; ++k) {
             d_out_results[out_base + k] = smem_merged_topk[k];
@@ -201,6 +264,7 @@ void launch_ivf_pq_search(
     uint32_t num_queries,
     uint32_t top_k,
     uint32_t nprobe,
+    uint32_t rerank_k,
     MetricType metric,
     GpuSearchResult* d_out_results,
     cudaStream_t stream
@@ -215,16 +279,22 @@ void launch_ivf_pq_search(
     if (clamped_nprobe == 0) clamped_nprobe = 1;
     if (clamped_nprobe > tables->nlist) clamped_nprobe = tables->nlist;
 
+    uint32_t shortlist = rerank_k;
+    if (shortlist == 0) shortlist = top_k;
+    if (shortlist > MAX_RERANK_CANDIDATES) shortlist = MAX_RERANK_CANDIDATES;
+    if (shortlist < top_k) shortlist = top_k;
+    if (shortlist > 256) shortlist = 256;
+
     dim3 grid(num_queries);
     dim3 block(BLOCK_SIZE_IVF);
 
-    // Shared memory: LUT (m_pq * 257 floats) + probed list (nprobe u32 +
-    // nprobe f32) + 8-byte-aligned top-k merged results.
+    // Shared memory: residual LUT (m_pq * 257 floats) + probed list
+    // (nprobe u32 + nprobe f32) + 8-byte-aligned shortlist.
     size_t raw_smem = ((size_t)tables->m_pq * SMEM_PQ_STRIDE * sizeof(float)) +
                       ((size_t)clamped_nprobe * sizeof(uint32_t)) +
                       ((size_t)clamped_nprobe * sizeof(float));
     size_t aligned_smem = (raw_smem + 7u) & ~7u;
-    size_t smem_bytes = aligned_smem + ((size_t)top_k * sizeof(GpuSearchResult));
+    size_t smem_bytes = aligned_smem + ((size_t)shortlist * sizeof(GpuSearchResult));
 
     ivf_pq_adc_kernel<<<grid, block, smem_bytes, stream>>>(
         tables->d_centroids,
@@ -232,6 +302,7 @@ void launch_ivf_pq_search(
         tables->d_pq_codes,
         tables->d_ivf_offsets,
         tables->d_ivf_vec_ids,
+        tables->d_vectors,
         tables->num_vectors,
         tables->dim,
         tables->nlist,
@@ -241,6 +312,7 @@ void launch_ivf_pq_search(
         num_queries,
         top_k,
         clamped_nprobe,
+        shortlist,
         metric,
         d_out_results
     );
@@ -256,6 +328,7 @@ int cuda_ivf_pq_search_batch(
     uint32_t num_queries,
     uint32_t top_k,
     uint32_t nprobe,
+    uint32_t rerank_k,
     MetricType metric,
     GpuSearchResult* d_out_results,
     void* stream
@@ -271,6 +344,7 @@ int cuda_ivf_pq_search_batch(
         num_queries,
         top_k,
         nprobe,
+        rerank_k,
         metric,
         d_out_results,
         s

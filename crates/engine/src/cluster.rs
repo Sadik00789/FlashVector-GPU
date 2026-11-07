@@ -49,13 +49,54 @@ impl KMeans {
             global_mean[d] *= inv_n;
         }
 
-        // 2. K-Means++ / Random Centroid Initialization
+        // 2. K-Means++ seeding over a bounded sample.
+        //
+        // Seeding cost is O(k * sample * dim) instead of O(k * n * dim), which
+        // keeps the coarse quantizer and every PQ sub-quantizer affordable at
+        // 1M scale while still spreading the initial centroids across the
+        // data instead of clustering them by chance.
         let mut sample_indices: Vec<usize> = (0..num_vectors).collect();
         sample_indices.shuffle(&mut rng);
 
+        let seed_pool = num_vectors.min(k.saturating_mul(64)).max(1);
+        let seed: Vec<usize> = sample_indices[..seed_pool].to_vec();
+
+        let first = seed[0];
         let mut centroids = Vec::with_capacity(k * dim);
-        for &idx in &sample_indices[..k] {
-            centroids.extend_from_slice(&vectors[idx * dim..(idx + 1) * dim]);
+        centroids.extend_from_slice(&vectors[first * dim..(first + 1) * dim]);
+
+        // Distance from every seed candidate to the nearest chosen centroid.
+        let mut closest: Vec<f32> = seed
+            .par_iter()
+            .map(|&idx| Self::l2_sq(&vectors[idx * dim..(idx + 1) * dim], &centroids[..dim]))
+            .collect();
+
+        for c in 1..k {
+            let last: Vec<f32> = centroids[(c - 1) * dim..c * dim].to_vec();
+            closest
+                .par_iter_mut()
+                .zip(seed.par_iter())
+                .for_each(|(best, &idx)| {
+                    let candidate =
+                        Self::l2_sq(&vectors[idx * dim..(idx + 1) * dim], &last);
+                    if candidate < *best {
+                        *best = candidate;
+                    }
+                });
+
+            let total: f64 = closest.iter().map(|&value| value as f64).sum();
+            let mut chosen = seed[seed_pool - 1];
+            if total > 0.0 {
+                let mut target = rand::Rng::gen_range(&mut rng, 0.0..total);
+                for (i, &distance) in closest.iter().enumerate() {
+                    target -= distance as f64;
+                    if target <= 0.0 {
+                        chosen = seed[i];
+                        break;
+                    }
+                }
+            }
+            centroids.extend_from_slice(&vectors[chosen * dim..(chosen + 1) * dim]);
         }
 
         let mut assignments = vec![0u32; num_vectors];

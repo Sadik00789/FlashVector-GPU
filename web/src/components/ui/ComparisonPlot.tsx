@@ -9,20 +9,19 @@ export default function ComparisonPlot() {
   // queries, on an NVIDIA RTX 3050 Laptop (sm_86). See the README benchmark
   // section for the full parameter sweep.
   const flashVectorHnswData = [
-    { recall: 0.7568, qps: 93686 },
-    { recall: 0.8767, qps: 51229 },
-    { recall: 0.9511, qps: 38338 },
-    { recall: 0.9848, qps: 15719 },
-    { recall: 0.9958, qps: 5629 },
+    { recall: 0.7568, qps: 19723 },
+    { recall: 0.8767, qps: 51070 },
+    { recall: 0.9511, qps: 38243 },
+    { recall: 0.9848, qps: 15670 },
+    { recall: 0.9958, qps: 5631 },
   ];
 
   const flashVectorIvfPqData = [
-    { recall: 0.352, qps: 83062 },
-    { recall: 0.496, qps: 34657 },
-    { recall: 0.5269, qps: 22697 },
-    { recall: 0.5382, qps: 14906 },
-    { recall: 0.5422, qps: 9522 },
-    { recall: 0.542, qps: 5800 },
+    { recall: 0.461, qps: 18790 },
+    { recall: 0.7454, qps: 4265 },
+    { recall: 0.8166, qps: 3089 },
+    { recall: 0.8454, qps: 2499 },
+    { recall: 0.8504, qps: 2151 },
   ];
 
   const hnswLibCpuData = [
@@ -36,10 +35,10 @@ export default function ComparisonPlot() {
   const height = 180;
   const pad = { top: 20, right: 20, bottom: 30, left: 45 };
 
-  const minR = 0.30;
+  const minR = 0.35;
   const maxR = 1.00;
   const minQ = 0;
-  const maxQ = 100000;
+  const maxQ = 60000;
 
   const toX = (r: number) => pad.left + ((r - minR) / (maxR - minR)) * (width - pad.left - pad.right);
   const toY = (q: number) => height - pad.bottom - ((q - minQ) / (maxQ - minQ)) * (height - pad.top - pad.bottom);
@@ -83,7 +82,7 @@ export default function ComparisonPlot() {
               strokeDasharray="3,3"
             />
           ))}
-          {[25000, 50000, 75000, 100000].map((q) => (
+          {[15000, 30000, 45000, 60000].map((q) => (
             <line
               key={q}
               x1={pad.left}
@@ -96,14 +95,14 @@ export default function ComparisonPlot() {
           ))}
 
           {/* Axes labels */}
-          <text x={toX(0.30)} y={height - 12} fill="#64748b" textAnchor="start">0.30</text>
-          <text x={toX(0.65)} y={height - 12} fill="#64748b" textAnchor="middle">0.65</text>
+          <text x={toX(0.35)} y={height - 12} fill="#64748b" textAnchor="start">0.35</text>
+          <text x={toX(0.675)} y={height - 12} fill="#64748b" textAnchor="middle">0.68</text>
           <text x={toX(1.00)} y={height - 12} fill="#64748b" textAnchor="end">1.00</text>
 
-          <text x={pad.left - 6} y={toY(25000)} fill="#64748b" textAnchor="end" dominantBaseline="middle">25k</text>
-          <text x={pad.left - 6} y={toY(50000)} fill="#64748b" textAnchor="end" dominantBaseline="middle">50k</text>
-          <text x={pad.left - 6} y={toY(75000)} fill="#64748b" textAnchor="end" dominantBaseline="middle">75k</text>
-          <text x={pad.left - 6} y={toY(100000)} fill="#64748b" textAnchor="end" dominantBaseline="middle">100k</text>
+          <text x={pad.left - 6} y={toY(15000)} fill="#64748b" textAnchor="end" dominantBaseline="middle">15k</text>
+          <text x={pad.left - 6} y={toY(30000)} fill="#64748b" textAnchor="end" dominantBaseline="middle">30k</text>
+          <text x={pad.left - 6} y={toY(45000)} fill="#64748b" textAnchor="end" dominantBaseline="middle">45k</text>
+          <text x={pad.left - 6} y={toY(60000)} fill="#64748b" textAnchor="end" dominantBaseline="middle">60k</text>
 
           {/* HNSWLib (CPU) Line */}
           <path d={makePath(hnswLibCpuData)} fill="none" stroke="#64748b" strokeWidth="2" />
@@ -147,7 +146,7 @@ export default function ComparisonPlot() {
         </div>
         <div className="flex items-center gap-1.5 text-purple-400">
           <span className="w-2.5 h-2.5 rounded-full bg-purple-500" />
-          <span>FlashVector IVF-PQ</span>
+          <span>IVF-PQ + rerank</span>
         </div>
         <div className="flex items-center gap-1.5 text-slate-400">
           <span className="w-2.5 h-2.5 rounded-full bg-slate-500" />
