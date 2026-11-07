@@ -136,7 +136,7 @@ export default function Dashboard() {
           </div>
           <div className="glass-panel px-3 py-1.5 rounded-xl border border-white/10 flex items-center gap-2">
             <Layers className="w-3.5 h-3.5 text-primary" />
-            <span className="text-slate-300">CUDA 12.6 + Rust FFI</span>
+            <span className="text-slate-300">CUDA 13.5 + Rust FFI</span>
           </div>
           <div className="glass-panel px-3 py-1.5 rounded-xl border border-white/10 flex items-center gap-2">
             <Activity className="w-3.5 h-3.5 text-accent" />

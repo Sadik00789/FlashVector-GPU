@@ -12,11 +12,11 @@ FlashVector-GPU includes an interactive Three.js/WebGL visualizer backed by an A
 
 ### 1. Warp-Cooperative HNSW Graph Beam Search
 ![FlashVector-GPU HNSW Warp Beam Traversal](assets/visualizer_hnsw_beam.png)
-*Figure 1: Real-time HNSW beam search routing across 10,000 vectors with `efSearch = 112`, tracing animated 3D traversal rays from the entry point to the top-k nearest neighbors.*
+*Figure 1: Real-time HNSW beam search routing across 10,000 vectors with `efSearch = 240` and `top_k = 46`, tracing animated 3D traversal rays across 960 recorded hops from the entry point to the top-k nearest neighbors.*
 
 ### 2. IVF-PQ Dynamic Shared-Memory ADC Lookup
 ![FlashVector-GPU IVF-PQ ADC Search](assets/visualizer_ivf_pq.png)
-*Figure 2: IVF-PQ asymmetric distance computation scanning probed Voronoi centroids and decompressing quantized vector codes in dynamic shared memory.*
+*Figure 2: IVF-PQ asymmetric distance computation with `nprobe = 28`, scoring probed Voronoi partitions and decompressing quantized vector codes in dynamic shared memory, then re-scoring the shortlist against full-precision vectors.*
 
 ---
 
