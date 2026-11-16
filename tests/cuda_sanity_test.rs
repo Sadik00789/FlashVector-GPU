@@ -1,3 +1,5 @@
+// Requires a CUDA device; compiled out in CPU-only builds (FLASHVECTOR_CPU_ONLY=1).
+#![cfg(not(flashvector_cpu_only))]
 use engine::{
     ffi::{gpu_bitonic_sort_test, gpu_compute_distances_warp, MetricType},
     init_gpu, DeviceBuffer, PinnedBuffer,
