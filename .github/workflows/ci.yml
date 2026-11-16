@@ -56,7 +56,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip \
             nvidia-cuda-nvcc nvidia-cuda-runtime nvidia-cuda-crt nvidia-cuda-cccl nvidia-nvvm
-          CU_ROOT=$(python -c "import nvidia, pathlib; root = pathlib.Path(nvidia.__file__).resolve().parent; print(next(p.parent.parent for p in root.rglob('bin/nvcc')))")
+          CU_ROOT=$(python -c "import nvidia, pathlib; root = pathlib.Path(list(nvidia.__path__)[0]).resolve(); print(next(p.parent.parent for p in root.rglob('bin/nvcc')))")
           echo "CUDA_HOME=$CU_ROOT" >> "$GITHUB_ENV"
           echo "CUDA_PATH=$CU_ROOT" >> "$GITHUB_ENV"
           echo "$CU_ROOT/bin" >> "$GITHUB_PATH"
