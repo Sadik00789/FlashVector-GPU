@@ -74,3 +74,9 @@ Thumbs.db
 
 # Command Code local state (taste/preferences)
 .commandcode/
+
+# Profiler traces (large binaries; publish via GitHub Releases, never commit)
+*.nsys-rep
+*.ncu-rep
+*.qdrep
+*.sqlite
