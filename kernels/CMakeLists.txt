@@ -44,38 +44,38 @@ else()
     set(OBJ_EXT "o")
 endif()
 
-set(SRC_FILES
-    "${KERNEL_SRC_DIR}/hnsw_traverse.cu"
-    "${KERNEL_SRC_DIR}/ivf_pq_lookup.cu"
+set(COMMON_HDRS
+    "${KERNEL_SRC_DIR}/distance_metrics.cuh"
+    "${KERNEL_SRC_DIR}/bitonic_topk.cuh"
+    "${KERNEL_SRC_DIR}/ivf_rerank.cuh"
+    "${KERNEL_INC_DIR}/types.h"
+    "${KERNEL_INC_DIR}/cuda_bridge.h"
 )
 
-set(OBJ_FILES
-    "${BUILD_DIR}/hnsw_traverse.${OBJ_EXT}"
-    "${BUILD_DIR}/ivf_pq_lookup.${OBJ_EXT}"
+set(KERNEL_UNITS
+    hnsw_traverse
+    cagra_search
+    ivf_pq_lookup
+    ivf_quant_lookup
+    sparse_hybrid
 )
 
-# Compile the CUDA translation units with nvcc (native CUDA compiler driver).
-add_custom_command(
-    OUTPUT "${BUILD_DIR}/hnsw_traverse.${OBJ_EXT}"
-    COMMAND ${CUDA_NVCC} -x cu ${NVCC_GENCODES} -O3 --use_fast_math -std=c++17
-        -I${KERNEL_INC_DIR} -I${CUDA_TOOLKIT_ROOT_DIR}/include ${NVCC_HOST_FLAGS} ${TRACE_DEFINE}
-        -c "${KERNEL_SRC_DIR}/hnsw_traverse.cu" -o "${BUILD_DIR}/hnsw_traverse.${OBJ_EXT}"
-    DEPENDS "${KERNEL_SRC_DIR}/hnsw_traverse.cu" "${KERNEL_SRC_DIR}/hnsw_traverse.cuh"
-            "${KERNEL_SRC_DIR}/distance_metrics.cuh" "${KERNEL_SRC_DIR}/bitonic_topk.cuh"
-            "${KERNEL_INC_DIR}/types.h" "${KERNEL_INC_DIR}/cuda_bridge.h"
-    COMMENT "Compiling hnsw_traverse.cu (arch ${CUDA_ARCH_LIST}, multi-arch fatbin)"
-)
+set(OBJ_FILES "")
+foreach(UNIT ${KERNEL_UNITS})
+    set(SRC_CU "${KERNEL_SRC_DIR}/${UNIT}.cu")
+    set(HDR_CUH "${KERNEL_SRC_DIR}/${UNIT}.cuh")
+    set(OUT_OBJ "${BUILD_DIR}/${UNIT}.${OBJ_EXT}")
+    list(APPEND OBJ_FILES "${OUT_OBJ}")
 
-add_custom_command(
-    OUTPUT "${BUILD_DIR}/ivf_pq_lookup.${OBJ_EXT}"
-    COMMAND ${CUDA_NVCC} -x cu ${NVCC_GENCODES} -O3 --use_fast_math -std=c++17
-        -I${KERNEL_INC_DIR} -I${CUDA_TOOLKIT_ROOT_DIR}/include ${NVCC_HOST_FLAGS} ${TRACE_DEFINE}
-        -c "${KERNEL_SRC_DIR}/ivf_pq_lookup.cu" -o "${BUILD_DIR}/ivf_pq_lookup.${OBJ_EXT}"
-    DEPENDS "${KERNEL_SRC_DIR}/ivf_pq_lookup.cu" "${KERNEL_SRC_DIR}/ivf_pq_lookup.cuh"
-            "${KERNEL_SRC_DIR}/distance_metrics.cuh" "${KERNEL_SRC_DIR}/bitonic_topk.cuh"
-            "${KERNEL_INC_DIR}/types.h" "${KERNEL_INC_DIR}/cuda_bridge.h"
-    COMMENT "Compiling ivf_pq_lookup.cu (arch ${CUDA_ARCH_LIST}, multi-arch fatbin)"
-)
+    add_custom_command(
+        OUTPUT "${OUT_OBJ}"
+        COMMAND ${CUDA_NVCC} -x cu ${NVCC_GENCODES} -O3 --use_fast_math -std=c++17
+            -I${KERNEL_INC_DIR} -I${CUDA_TOOLKIT_ROOT_DIR}/include ${NVCC_HOST_FLAGS} ${TRACE_DEFINE}
+            -c "${SRC_CU}" -o "${OUT_OBJ}"
+        DEPENDS "${SRC_CU}" "${HDR_CUH}" ${COMMON_HDRS}
+        COMMENT "Compiling ${UNIT}.cu (arch ${CUDA_ARCH_LIST}, multi-arch fatbin)"
+    )
+endforeach()
 
 if(WIN32)
     set(KERNEL_LIB "${BUILD_DIR}/gpukernels.lib")

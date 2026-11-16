@@ -6,13 +6,10 @@ namespace flashvector {
 #define WARPS_PER_BLOCK 4
 #define THREADS_PER_BLOCK (WARPS_PER_BLOCK * WARP_SIZE)
 
-// Trace instrumentation is compiled into a dedicated kernel variant so the
-// default search path pays no branch or shared-memory-atomic overhead.
-#ifdef FLASHVECTOR_TRACE_MODE
-#define FLASHVECTOR_TRACE_ENABLED 1
-#else
-#define FLASHVECTOR_TRACE_ENABLED 0
-#endif
+// Fewer warps per block for the filtered/debug variant so valid-result queues
+// fit comfortably inside the 48 KB Turing/Ampere static shared memory budget.
+#define DEBUG_WARPS_PER_BLOCK 2
+#define DEBUG_THREADS_PER_BLOCK (DEBUG_WARPS_PER_BLOCK * WARP_SIZE)
 
 #define TRACE_LOG(hop_ptr, hop_count, warp_idx, query_idx_, max_hops, from_node_, to_node_, dist_) \
     do { \
@@ -28,8 +25,7 @@ namespace flashvector {
         } \
     } while (0)
 
-// Warp-cooperative HNSW beam-search graph traversal kernel.
-// ENABLE_TRACE selects the telemetry-recording variant at compile time.
+// Unfiltered fast warp-cooperative HNSW beam-search kernel (4 warps/block).
 template <bool ENABLE_TRACE>
 __global__ void hnsw_warp_traverse_kernel(
     const float* __restrict__ d_vectors,
@@ -50,15 +46,14 @@ __global__ void hnsw_warp_traverse_kernel(
     uint32_t max_hops_per_query
 ) {
     int global_warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
-    if (global_warp_id >= num_queries) return;
+    if (global_warp_id >= (int)num_queries) return;
 
     int warp_in_block = threadIdx.x / WARP_SIZE;
     int lane_id = threadIdx.x % WARP_SIZE;
 
-    uint32_t query_idx = global_warp_id;
+    uint32_t query_idx = (uint32_t)global_warp_id;
     const float* query = &d_queries[query_idx * dim];
 
-    // Shared memory candidate list per warp
     __shared__ CandidateList<MAX_BEAM_WIDTH> s_candidates[WARPS_PER_BLOCK];
     __shared__ uint32_t s_hop_count[WARPS_PER_BLOCK];
     __shared__ uint32_t s_visited_hash[WARPS_PER_BLOCK][VISITED_HASH_TABLE_SIZE];
@@ -71,20 +66,17 @@ __global__ void hnsw_warp_traverse_kernel(
     if (clamped_ef > MAX_BEAM_WIDTH) clamped_ef = MAX_BEAM_WIDTH;
     if (clamped_ef == 0) clamped_ef = 1;
 
-    // Initialize visited hash table and candidate queue in lane 0
     if (lane_id == 0) {
-        candidates.init(clamped_ef);
+        candidates.init((int)clamped_ef);
         s_hop_count[warp_in_block] = 0;
     }
 
-    // Clear 4-way visited table across warp
     for (int i = lane_id; i < VISITED_HASH_TABLE_SIZE; i += WARP_SIZE) {
         visited_table[i] = 0xFFFFFFFFU;
     }
     __syncwarp();
 
-    // Compute distance from query to entry point
-    float ep_dist = warp_compute_distance(query, &d_vectors[entry_point * dim], dim, lane_id, metric);
+    float ep_dist = warp_compute_distance(query, &d_vectors[entry_point * dim], (int)dim, lane_id, metric);
 
     if (lane_id == 0) {
         candidates.insert(entry_point, ep_dist);
@@ -92,40 +84,30 @@ __global__ void hnsw_warp_traverse_kernel(
     }
     __syncwarp();
 
-    // Beam search main loop
     int max_iterations = (int)clamped_ef * 2;
     for (int iter = 0; iter < max_iterations; ++iter) {
-        // Step 1: Select closest unvisited candidate
         int current_idx = -1;
         uint32_t current_node = 0;
-        float current_dist = 0.0f;
 
         if (lane_id == 0) {
             current_idx = candidates.get_next_unvisited();
             if (current_idx >= 0) {
                 current_node = candidates.ids[current_idx];
-                current_dist = candidates.distances[current_idx];
                 candidates.visited[current_idx] = true;
             }
         }
 
-        // Broadcast selected node to all warp lanes
         current_idx = __shfl_sync(FULL_WARP_MASK, current_idx, 0);
-        if (current_idx < 0) {
-            break; // All reachable candidates visited
-        }
+        if (current_idx < 0) break;
         current_node = __shfl_sync(FULL_WARP_MASK, current_node, 0);
-        current_dist = __shfl_sync(FULL_WARP_MASK, current_dist, 0);
 
-        // Fetch neighbor degree
         uint32_t degree = d_degree[current_node];
         if (degree > m_max) degree = m_max;
 
         const uint32_t* neighbors = &d_adjacency[current_node * m_max];
 
-        // Step 2: Iterate over outgoing neighbor edges in coalesced batches of 32
         for (uint32_t n_offset = 0; n_offset < degree; n_offset += WARP_SIZE) {
-            uint32_t n_idx = n_offset + lane_id;
+            uint32_t n_idx = n_offset + (uint32_t)lane_id;
             uint32_t neighbor_id = (n_idx < degree) ? neighbors[n_idx] : 0xFFFFFFFFU;
 
             unsigned int valid_mask = __ballot_sync(
@@ -133,13 +115,9 @@ __global__ void hnsw_warp_traverse_kernel(
                 neighbor_id != 0xFFFFFFFFU && neighbor_id < num_nodes
             );
 
-            // Serialize visited-table probing through lane 0. The 4-way table
-            // is shared per warp, so concurrent inserts from all lanes would
-            // race on colliding hash buckets.
             while (valid_mask != 0) {
                 int leader_lane = __ffs(valid_mask) - 1;
-                uint32_t target_node =
-                    __shfl_sync(FULL_WARP_MASK, neighbor_id, leader_lane);
+                uint32_t target_node = __shfl_sync(FULL_WARP_MASK, neighbor_id, leader_lane);
 
                 int is_unvisited = 0;
                 if (lane_id == 0) {
@@ -148,16 +126,14 @@ __global__ void hnsw_warp_traverse_kernel(
                 is_unvisited = __shfl_sync(FULL_WARP_MASK, is_unvisited, 0);
 
                 if (is_unvisited) {
-                    // All 32 threads cooperatively compute distance to target_node
                     float dist = warp_compute_distance(
                         query,
                         &d_vectors[target_node * dim],
-                        dim,
+                        (int)dim,
                         lane_id,
                         metric
                     );
 
-                    // Lane 0 inserts into candidate queue and records traversal hop
                     if (lane_id == 0) {
                         candidates.insert(target_node, dist);
                         if constexpr (ENABLE_TRACE) {
@@ -175,14 +151,12 @@ __global__ void hnsw_warp_traverse_kernel(
                     }
                 }
 
-                // Clear leader lane from active mask
                 valid_mask &= ~(1U << leader_lane);
             }
         }
         __syncwarp();
     }
 
-    // Step 3: Write out top-k nearest neighbors
     if (lane_id == 0) {
         uint32_t out_base = query_idx * top_k;
         int count = candidates.size < (int)top_k ? candidates.size : (int)top_k;
@@ -201,6 +175,214 @@ __global__ void hnsw_warp_traverse_kernel(
     }
 }
 
+// Filter-aware and/or beam-debug HNSW warp traversal kernel (2 warps/block).
+// Keeps separate `beam` (traversal routing) and `valid_results` (strictly unmasked
+// top-k output), skipping distance evaluation for masked neighbors whenever enough
+// unmasked candidates are already queued to avoid wasted compute.
+template <bool ENABLE_DEBUG>
+__global__ void hnsw_warp_traverse_filtered_kernel(
+    const float* __restrict__ d_vectors,
+    const uint32_t* __restrict__ d_adjacency,
+    const uint32_t* __restrict__ d_degree,
+    uint32_t num_nodes,
+    uint32_t dim,
+    uint32_t m_max,
+    uint32_t entry_point,
+    const float* __restrict__ d_queries,
+    uint32_t num_queries,
+    uint32_t top_k,
+    uint32_t ef_search,
+    MetricType metric,
+    const uint32_t* __restrict__ d_valid_mask,
+    GpuSearchResult* __restrict__ d_out_results,
+    TraversalHop* __restrict__ d_out_hops,
+    uint32_t* __restrict__ d_out_hop_counts,
+    uint32_t max_hops_per_query,
+    BeamStepRecord* __restrict__ d_out_steps,
+    uint32_t* __restrict__ d_out_step_counts,
+    uint32_t max_steps_per_query
+) {
+    int global_warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
+    if (global_warp_id >= (int)num_queries) return;
+
+    int warp_in_block = threadIdx.x / WARP_SIZE;
+    int lane_id = threadIdx.x % WARP_SIZE;
+
+    uint32_t query_idx = (uint32_t)global_warp_id;
+    const float* query = &d_queries[query_idx * dim];
+
+    __shared__ CandidateList<MAX_BEAM_WIDTH> s_beam[DEBUG_WARPS_PER_BLOCK];
+    __shared__ CandidateList<MAX_BEAM_WIDTH> s_valid_results[DEBUG_WARPS_PER_BLOCK];
+    __shared__ uint32_t s_hop_count[DEBUG_WARPS_PER_BLOCK];
+    __shared__ uint32_t s_step_count[DEBUG_WARPS_PER_BLOCK];
+    __shared__ uint32_t s_visited_hash[DEBUG_WARPS_PER_BLOCK][VISITED_HASH_TABLE_SIZE];
+
+    CandidateList<MAX_BEAM_WIDTH>& beam = s_beam[warp_in_block];
+    CandidateList<MAX_BEAM_WIDTH>& valid_results = s_valid_results[warp_in_block];
+    uint32_t* visited_table = s_visited_hash[warp_in_block];
+
+    uint32_t clamped_ef = ef_search;
+    if (clamped_ef < top_k) clamped_ef = top_k;
+    if (clamped_ef > MAX_BEAM_WIDTH) clamped_ef = MAX_BEAM_WIDTH;
+    if (clamped_ef == 0) clamped_ef = 1;
+
+    if (lane_id == 0) {
+        beam.init((int)clamped_ef);
+        valid_results.init((int)(top_k > 0 ? top_k : 1));
+        s_hop_count[warp_in_block] = 0;
+        s_step_count[warp_in_block] = 0;
+    }
+
+    for (int i = lane_id; i < VISITED_HASH_TABLE_SIZE; i += WARP_SIZE) {
+        visited_table[i] = 0xFFFFFFFFU;
+    }
+    __syncwarp();
+
+    float ep_dist = warp_compute_distance(query, &d_vectors[entry_point * dim], (int)dim, lane_id, metric);
+
+    if (lane_id == 0) {
+        beam.insert(entry_point, ep_dist);
+        if (bitmask_allows(d_valid_mask, entry_point)) {
+            valid_results.insert(entry_point, ep_dist);
+        }
+        insert_visited(visited_table, entry_point);
+    }
+    __syncwarp();
+
+    int max_iterations = (int)clamped_ef * 2;
+    for (int iter = 0; iter < max_iterations; ++iter) {
+        int current_idx = -1;
+        uint32_t current_node = 0;
+        float current_dist = 0.0f;
+        uint32_t hop_start = 0;
+
+        if (lane_id == 0) {
+            current_idx = beam.get_next_unvisited();
+            if (current_idx >= 0) {
+                current_node = beam.ids[current_idx];
+                current_dist = beam.distances[current_idx];
+                beam.visited[current_idx] = true;
+                hop_start = s_hop_count[warp_in_block];
+            }
+        }
+
+        current_idx = __shfl_sync(FULL_WARP_MASK, current_idx, 0);
+        if (current_idx < 0) break;
+        current_node = __shfl_sync(FULL_WARP_MASK, current_node, 0);
+        current_dist = __shfl_sync(FULL_WARP_MASK, current_dist, 0);
+        hop_start = __shfl_sync(FULL_WARP_MASK, hop_start, 0);
+
+        uint32_t degree = d_degree[current_node];
+        if (degree > m_max) degree = m_max;
+        const uint32_t* neighbors = &d_adjacency[current_node * m_max];
+
+        for (uint32_t n_offset = 0; n_offset < degree; n_offset += WARP_SIZE) {
+            uint32_t n_idx = n_offset + (uint32_t)lane_id;
+            uint32_t neighbor_id = (n_idx < degree) ? neighbors[n_idx] : 0xFFFFFFFFU;
+
+            unsigned int valid_mask = __ballot_sync(
+                FULL_WARP_MASK,
+                neighbor_id != 0xFFFFFFFFU && neighbor_id < num_nodes
+            );
+
+            while (valid_mask != 0) {
+                int leader_lane = __ffs(valid_mask) - 1;
+                uint32_t target_node = __shfl_sync(FULL_WARP_MASK, neighbor_id, leader_lane);
+
+                int should_eval = 0;
+                int target_allowed = 1;
+                if (lane_id == 0) {
+                    target_allowed = bitmask_allows(d_valid_mask, target_node) ? 1 : 0;
+                    // Skip masked neighbors directly once top_k valid results are populated;
+                    // only traverse through masked bridge nodes while searching sparse filters.
+                    bool allow_visit = (target_allowed != 0) || (valid_results.size < (int)top_k);
+                    if (allow_visit && insert_visited(visited_table, target_node)) {
+                        should_eval = 1;
+                    }
+                }
+                should_eval = __shfl_sync(FULL_WARP_MASK, should_eval, 0);
+                target_allowed = __shfl_sync(FULL_WARP_MASK, target_allowed, 0);
+
+                if (should_eval) {
+                    float dist = warp_compute_distance(
+                        query,
+                        &d_vectors[target_node * dim],
+                        (int)dim,
+                        lane_id,
+                        metric
+                    );
+
+                    if (lane_id == 0) {
+                        beam.insert(target_node, dist);
+                        if (target_allowed != 0) {
+                            valid_results.insert(target_node, dist);
+                        }
+                        if constexpr (ENABLE_DEBUG) {
+                            TRACE_LOG(
+                                d_out_hops,
+                                s_hop_count,
+                                warp_in_block,
+                                query_idx,
+                                max_hops_per_query,
+                                current_node,
+                                target_node,
+                                dist
+                            );
+                        }
+                    }
+                }
+
+                valid_mask &= ~(1U << leader_lane);
+            }
+        }
+
+        if constexpr (ENABLE_DEBUG) {
+            if (lane_id == 0 && d_out_steps != nullptr && d_out_step_counts != nullptr) {
+                uint32_t step_idx = s_step_count[warp_in_block];
+                if (step_idx < max_steps_per_query) {
+                    BeamStepRecord& rec = d_out_steps[query_idx * max_steps_per_query + step_idx];
+                    rec.iteration = (uint32_t)iter;
+                    rec.expanded_node = current_node;
+                    rec.expanded_distance = current_dist;
+                    rec.eval_start = hop_start;
+                    uint32_t hop_end = s_hop_count[warp_in_block];
+                    rec.eval_count = (hop_end > hop_start) ? (hop_end - hop_start) : 0U;
+                    int snap_n = beam.size < BEAM_DEBUG_MAX_CANDS ? beam.size : BEAM_DEBUG_MAX_CANDS;
+                    rec.cand_count = (uint32_t)snap_n;
+                    for (int c = 0; c < snap_n; ++c) {
+                        rec.candidates[c].id = beam.ids[c];
+                        rec.candidates[c].distance = beam.distances[c];
+                        rec.candidates[c].visited = beam.visited[c] ? 1U : 0U;
+                        rec.candidates[c]._pad = 0U;
+                    }
+                }
+                s_step_count[warp_in_block] = step_idx + 1U;
+            }
+        }
+        __syncwarp();
+    }
+
+    if (lane_id == 0) {
+        uint32_t out_base = query_idx * top_k;
+        int count = valid_results.size < (int)top_k ? valid_results.size : (int)top_k;
+        for (int k = 0; k < count; ++k) {
+            d_out_results[out_base + k].id = valid_results.ids[k];
+            d_out_results[out_base + k].distance = valid_results.distances[k];
+        }
+        for (int k = count; k < (int)top_k; ++k) {
+            d_out_results[out_base + k].id = 0xFFFFFFFFU;
+            d_out_results[out_base + k].distance = 1e30f;
+        }
+
+        if (d_out_hop_counts != nullptr) {
+            d_out_hop_counts[query_idx] = s_hop_count[warp_in_block];
+        }
+        if (d_out_step_counts != nullptr) {
+            d_out_step_counts[query_idx] = s_step_count[warp_in_block];
+        }
+    }
+}
+
 // Verification test kernel: computes distance matrix using warp reductions
 __global__ void compute_distances_warp_kernel(
     const float* __restrict__ d_queries,
@@ -212,18 +394,20 @@ __global__ void compute_distances_warp_kernel(
     float* __restrict__ d_out_distances
 ) {
     int global_warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
-    int total_elements = num_queries * num_vectors;
+    int total_elements = (int)(num_queries * num_vectors);
     if (global_warp_id >= total_elements) return;
 
     int lane_id = threadIdx.x % WARP_SIZE;
+    uint32_t q_idx = (uint32_t)global_warp_id / num_vectors;
+    uint32_t v_idx = (uint32_t)global_warp_id % num_vectors;
 
-    uint32_t q_idx = global_warp_id / num_vectors;
-    uint32_t v_idx = global_warp_id % num_vectors;
-
-    const float* query = &d_queries[q_idx * dim];
-    const float* vector = &d_dataset[v_idx * dim];
-
-    float dist = warp_compute_distance(query, vector, dim, lane_id, metric);
+    float dist = warp_compute_distance(
+        &d_queries[q_idx * dim],
+        &d_dataset[v_idx * dim],
+        (int)dim,
+        lane_id,
+        metric
+    );
 
     if (lane_id == 0) {
         d_out_distances[global_warp_id] = dist;
@@ -241,12 +425,12 @@ __global__ void bitonic_sort_test_kernel(
     int tid = threadIdx.x;
     if (tid >= WARP_SIZE) return;
 
-    float key = (tid < n) ? d_keys_in[tid] : 1e30f;
-    uint32_t val = (tid < n) ? d_vals_in[tid] : 0xFFFFFFFFU;
+    float key = ((uint32_t)tid < n) ? d_keys_in[tid] : 1e30f;
+    uint32_t val = ((uint32_t)tid < n) ? d_vals_in[tid] : 0xFFFFFFFFU;
 
     warp_bitonic_sort_32(key, val, tid);
 
-    if (tid < n) {
+    if ((uint32_t)tid < n) {
         d_keys_out[tid] = key;
         d_vals_out[tid] = val;
     }
@@ -260,6 +444,7 @@ void launch_hnsw_search(
     uint32_t top_k,
     uint32_t ef_search,
     MetricType metric,
+    const uint32_t* d_valid_mask,
     GpuSearchResult* d_out_results,
     TraversalHop* d_out_hops,
     uint32_t* d_out_hop_counts,
@@ -268,52 +453,68 @@ void launch_hnsw_search(
 ) {
     if (num_queries == 0) return;
 
-    uint32_t total_warps = num_queries;
-    uint32_t num_blocks = (total_warps + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
-
     bool enable_trace = (d_out_hops != nullptr) &&
                         (d_out_hop_counts != nullptr) &&
                         (max_hops_per_query > 0);
 
+    if (d_valid_mask != nullptr) {
+        uint32_t num_blocks = (num_queries + DEBUG_WARPS_PER_BLOCK - 1) / DEBUG_WARPS_PER_BLOCK;
+        if (enable_trace) {
+            hnsw_warp_traverse_filtered_kernel<true><<<num_blocks, DEBUG_THREADS_PER_BLOCK, 0, stream>>>(
+                graph->d_vectors, graph->d_adjacency, graph->d_degree, graph->num_nodes,
+                dim, graph->m_max, graph->entry_point, d_queries, num_queries, top_k,
+                ef_search, metric, d_valid_mask, d_out_results, d_out_hops,
+                d_out_hop_counts, max_hops_per_query, nullptr, nullptr, 0
+            );
+        } else {
+            hnsw_warp_traverse_filtered_kernel<false><<<num_blocks, DEBUG_THREADS_PER_BLOCK, 0, stream>>>(
+                graph->d_vectors, graph->d_adjacency, graph->d_degree, graph->num_nodes,
+                dim, graph->m_max, graph->entry_point, d_queries, num_queries, top_k,
+                ef_search, metric, d_valid_mask, d_out_results, nullptr,
+                nullptr, 0, nullptr, nullptr, 0
+            );
+        }
+        return;
+    }
+
+    uint32_t num_blocks = (num_queries + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
     if (enable_trace) {
         hnsw_warp_traverse_kernel<true><<<num_blocks, THREADS_PER_BLOCK, 0, stream>>>(
-            graph->d_vectors,
-            graph->d_adjacency,
-            graph->d_degree,
-            graph->num_nodes,
-            dim,
-            graph->m_max,
-            graph->entry_point,
-            d_queries,
-            num_queries,
-            top_k,
-            ef_search,
-            metric,
-            d_out_results,
-            d_out_hops,
-            d_out_hop_counts,
-            max_hops_per_query
+            graph->d_vectors, graph->d_adjacency, graph->d_degree, graph->num_nodes,
+            dim, graph->m_max, graph->entry_point, d_queries, num_queries, top_k,
+            ef_search, metric, d_out_results, d_out_hops, d_out_hop_counts, max_hops_per_query
         );
     } else {
         hnsw_warp_traverse_kernel<false><<<num_blocks, THREADS_PER_BLOCK, 0, stream>>>(
-            graph->d_vectors,
-            graph->d_adjacency,
-            graph->d_degree,
-            graph->num_nodes,
-            dim,
-            graph->m_max,
-            graph->entry_point,
-            d_queries,
-            num_queries,
-            top_k,
-            ef_search,
-            metric,
-            d_out_results,
-            d_out_hops,
-            d_out_hop_counts,
-            max_hops_per_query
+            graph->d_vectors, graph->d_adjacency, graph->d_degree, graph->num_nodes,
+            dim, graph->m_max, graph->entry_point, d_queries, num_queries, top_k,
+            ef_search, metric, d_out_results, d_out_hops, d_out_hop_counts, max_hops_per_query
         );
     }
+}
+
+void launch_hnsw_search_debug(
+    const HnswGpuGraph* graph,
+    const float* d_query,
+    uint32_t top_k,
+    uint32_t ef_search,
+    MetricType metric,
+    const uint32_t* d_valid_mask,
+    GpuSearchResult* d_out_results,
+    TraversalHop* d_out_hops,
+    uint32_t* d_out_hop_count,
+    uint32_t max_hops,
+    BeamStepRecord* d_out_steps,
+    uint32_t* d_out_step_count,
+    uint32_t max_steps,
+    cudaStream_t stream
+) {
+    hnsw_warp_traverse_filtered_kernel<true><<<1, DEBUG_THREADS_PER_BLOCK, 0, stream>>>(
+        graph->d_vectors, graph->d_adjacency, graph->d_degree, graph->num_nodes,
+        graph->dim, graph->m_max, graph->entry_point, d_query, 1, top_k,
+        ef_search, metric, d_valid_mask, d_out_results, d_out_hops,
+        d_out_hop_count, max_hops, d_out_steps, d_out_step_count, max_steps
+    );
 }
 
 } // namespace flashvector
@@ -324,7 +525,16 @@ extern "C" {
 int cuda_init_device(int device_id) {
     cudaError_t err = cudaSetDevice(device_id);
     if (err != cudaSuccess) return (int)err;
-    return (int)cudaFree(0); // Initialize context
+    return (int)cudaFree(0);
+}
+
+int cuda_set_device(int device_id) {
+    return (int)cudaSetDevice(device_id);
+}
+
+int cuda_get_device_count(int* count) {
+    if (!count) return -1;
+    return (int)cudaGetDeviceCount(count);
 }
 
 int cuda_get_device_memory(size_t* free_bytes, size_t* total_bytes) {
@@ -334,6 +544,38 @@ int cuda_get_device_memory(size_t* free_bytes, size_t* total_bytes) {
 
 int cuda_device_synchronize(void) {
     return (int)cudaDeviceSynchronize();
+}
+
+int cuda_enable_peer_access(int device, int peer) {
+    if (device == peer) return 0;
+    int can_access = 0;
+    cudaError_t err = cudaDeviceCanAccessPeer(&can_access, device, peer);
+    if (err != cudaSuccess) return (int)err;
+    if (!can_access) return (int)cudaErrorPeerAccessUnsupported;
+    int prev = 0;
+    cudaGetDevice(&prev);
+    err = cudaSetDevice(device);
+    if (err != cudaSuccess) return (int)err;
+    err = cudaDeviceEnablePeerAccess(peer, 0);
+    if (err == cudaErrorPeerAccessAlreadyEnabled) {
+        cudaGetLastError();
+        err = cudaSuccess;
+    }
+    cudaSetDevice(prev);
+    return (int)err;
+}
+
+int cuda_memcpy_peer_async(
+    void* dst,
+    int dst_device,
+    const void* src,
+    int src_device,
+    size_t bytes,
+    void* stream
+) {
+    if (!dst || !src) return -1;
+    if (bytes == 0) return 0;
+    return (int)cudaMemcpyPeerAsync(dst, dst_device, src, src_device, bytes, (cudaStream_t)stream);
 }
 
 int cuda_malloc_device(void** ptr, size_t bytes) {
@@ -356,6 +598,11 @@ int cuda_free_host(void* ptr) {
     return (int)cudaFreeHost(ptr);
 }
 
+int cuda_host_get_device_pointer(void** dev_ptr, void* host_ptr) {
+    if (!dev_ptr || !host_ptr) return -1;
+    return (int)cudaHostGetDevicePointer(dev_ptr, host_ptr, 0);
+}
+
 int cuda_memcpy_h2d_async(void* dst, const void* src, size_t bytes, void* stream) {
     if (!dst || !src) return -1;
     if (bytes == 0) return 0;
@@ -366,6 +613,12 @@ int cuda_memcpy_d2h_async(void* dst, const void* src, size_t bytes, void* stream
     if (!dst || !src) return -1;
     if (bytes == 0) return 0;
     return (int)cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToHost, (cudaStream_t)stream);
+}
+
+int cuda_memset_device_async(void* dst, int value, size_t bytes, void* stream) {
+    if (!dst) return -1;
+    if (bytes == 0) return 0;
+    return (int)cudaMemsetAsync(dst, value, bytes, (cudaStream_t)stream);
 }
 
 int cuda_create_stream(void** stream) {
@@ -391,30 +644,47 @@ int cuda_hnsw_search_batch(
     uint32_t top_k,
     uint32_t ef_search,
     MetricType metric,
+    const uint32_t* d_valid_mask,
     GpuSearchResult* d_out_results,
     TraversalHop* d_out_hops,
     uint32_t* d_out_hop_counts,
     uint32_t max_hops_per_query,
     void* stream
 ) {
-    if (!graph || !d_queries || !d_out_results) {
-        return -1;
-    }
+    if (!graph || !d_queries || !d_out_results) return -1;
 
-    cudaStream_t s = (cudaStream_t)stream;
     flashvector::launch_hnsw_search(
-        graph,
-        d_queries,
-        num_queries,
-        dim,
-        top_k,
-        ef_search,
-        metric,
-        d_out_results,
-        d_out_hops,
-        d_out_hop_counts,
-        max_hops_per_query,
-        s
+        graph, d_queries, num_queries, dim, top_k, ef_search, metric,
+        d_valid_mask, d_out_results, d_out_hops, d_out_hop_counts,
+        max_hops_per_query, (cudaStream_t)stream
+    );
+
+    cudaError_t err = cudaGetLastError();
+    return (err == cudaSuccess) ? 0 : (int)err;
+}
+
+int cuda_hnsw_search_batch_debug(
+    const HnswGpuGraph* graph,
+    const float* d_query,
+    uint32_t top_k,
+    uint32_t ef_search,
+    MetricType metric,
+    const uint32_t* d_valid_mask,
+    GpuSearchResult* d_out_results,
+    TraversalHop* d_out_hops,
+    uint32_t* d_out_hop_count,
+    uint32_t max_hops,
+    BeamStepRecord* d_out_steps,
+    uint32_t* d_out_step_count,
+    uint32_t max_steps,
+    void* stream
+) {
+    if (!graph || !d_query || !d_out_results) return -1;
+
+    flashvector::launch_hnsw_search_debug(
+        graph, d_query, top_k, ef_search, metric, d_valid_mask,
+        d_out_results, d_out_hops, d_out_hop_count, max_hops,
+        d_out_steps, d_out_step_count, max_steps, (cudaStream_t)stream
     );
 
     cudaError_t err = cudaGetLastError();
@@ -437,13 +707,7 @@ int cuda_compute_distances_warp(
     uint32_t num_blocks = (total_pairs + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
 
     flashvector::compute_distances_warp_kernel<<<num_blocks, THREADS_PER_BLOCK, 0, (cudaStream_t)stream>>>(
-        d_queries,
-        d_dataset,
-        num_queries,
-        num_vectors,
-        dim,
-        metric,
-        d_out_distances
+        d_queries, d_dataset, num_queries, num_vectors, dim, metric, d_out_distances
     );
 
     cudaError_t err = cudaGetLastError();
@@ -461,11 +725,7 @@ int cuda_bitonic_sort_test(
     if (!d_keys_in || !d_vals_in || !d_keys_out || !d_vals_out) return -1;
 
     flashvector::bitonic_sort_test_kernel<<<1, WARP_SIZE, 0, (cudaStream_t)stream>>>(
-        d_keys_in,
-        d_vals_in,
-        d_keys_out,
-        d_vals_out,
-        n
+        d_keys_in, d_vals_in, d_keys_out, d_vals_out, n
     );
 
     cudaError_t err = cudaGetLastError();

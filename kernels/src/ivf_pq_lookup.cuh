@@ -9,9 +9,8 @@
 
 namespace flashvector {
 
-#define MAX_PQ_M 64
-#define PQ_CENTROIDS 256
-// Stride of 257 floats eliminates 32-way shared memory bank conflicts
+// Stride 257 eliminates 32-way shared-memory bank conflicts when threads in a
+// warp read smem_lut[m * 257 + code] in parallel.
 #define SMEM_PQ_STRIDE 257
 
 void launch_ivf_pq_search(
@@ -22,6 +21,7 @@ void launch_ivf_pq_search(
     uint32_t nprobe,
     uint32_t rerank_k,
     MetricType metric,
+    const uint32_t* d_valid_mask,
     GpuSearchResult* d_out_results,
     cudaStream_t stream
 );

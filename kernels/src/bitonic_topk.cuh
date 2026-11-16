@@ -66,6 +66,34 @@ __device__ __forceinline__ void warp_bitonic_sort_32(
     bitonic_stage_warp(key, val, 5, 0, lane_id);
 }
 
+// Block-wide parallel bitonic sort network over `arr[0..n_pow2)` in shared or global memory.
+// Callers must pad `arr[count..n_pow2)` with `{0xFFFFFFFFU, 1e30f}` beforehand.
+__device__ __inline__ void block_bitonic_sort_inplace(
+    GpuSearchResult* arr,
+    uint32_t n_pow2,
+    int tid,
+    int block_size
+) {
+    for (uint32_t k = 2; k <= n_pow2; k <<= 1) {
+        for (uint32_t j = k >> 1; j > 0; j >>= 1) {
+            for (uint32_t i = (uint32_t)tid; i < n_pow2; i += (uint32_t)block_size) {
+                uint32_t ixj = i ^ j;
+                if (ixj > i) {
+                    bool ascending = (i & k) == 0;
+                    GpuSearchResult a = arr[i];
+                    GpuSearchResult b = arr[ixj];
+                    bool swap = ascending ? (a.distance > b.distance) : (a.distance < b.distance);
+                    if (swap) {
+                        arr[i] = b;
+                        arr[ixj] = a;
+                    }
+                }
+            }
+            __syncthreads();
+        }
+    }
+}
+
 // Fixed-capacity sorted candidate queue for HNSW & IVF beam search
 template <int MAX_CAPACITY = 256>
 struct CandidateList {
@@ -131,8 +159,6 @@ struct CandidateList {
 };
 
 // Block-wide parallel top-k merger across all threads in a thread block.
-// Each thread submits every candidate it holds (not just its best one), so no
-// local top-k entry is lost during the block reduction.
 template <int MAX_K = 32>
 __device__ __inline__ void block_bitonic_merge_topk(
     const CandidateList<MAX_K>& local_list,
@@ -141,7 +167,6 @@ __device__ __inline__ void block_bitonic_merge_topk(
     int tid,
     int block_size
 ) {
-    // 1. Thread 0 initializes merged queue in shared memory
     if (tid == 0) {
         for (int k = 0; k < top_k; ++k) {
             smem_merged[k].id = 0xFFFFFFFFU;
@@ -150,7 +175,6 @@ __device__ __inline__ void block_bitonic_merge_topk(
     }
     __syncthreads();
 
-    // 2. Serialize across threads, but insert ALL local candidates per thread
     for (int t = 0; t < block_size; ++t) {
         if (tid == t) {
             for (int k = 0; k < local_list.size; ++k) {

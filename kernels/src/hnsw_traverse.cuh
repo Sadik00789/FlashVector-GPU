@@ -11,8 +11,6 @@ namespace flashvector {
 
 #define MAX_BEAM_WIDTH 256
 #define MAX_NEIGHBORS_PER_NODE 64
-// 4 warps x 2048 entries x 4 bytes = 32 KB. Combined with the per-warp
-// candidate queues this stays below the 48 KB Ampere static smem limit.
 #define VISITED_HASH_TABLE_SIZE 2048
 
 // 4-Way open-addressing visited hash table with linear probing
@@ -21,13 +19,13 @@ __device__ __forceinline__ bool insert_visited(uint32_t* table, uint32_t node_id
     #pragma unroll
     for (int p = 0; p < 4; ++p) {
         uint32_t idx = (h + p) & (VISITED_HASH_TABLE_SIZE - 1);
-        if (table[idx] == node_id) return false; // Already visited
+        if (table[idx] == node_id) return false;
         if (table[idx] == 0xFFFFFFFFU) {
             table[idx] = node_id;
-            return true; // Successfully marked as newly visited
+            return true;
         }
     }
-    return true; // Table bucket full, proceed conservatively
+    return true;
 }
 
 void launch_hnsw_search(
@@ -38,10 +36,28 @@ void launch_hnsw_search(
     uint32_t top_k,
     uint32_t ef_search,
     MetricType metric,
+    const uint32_t* d_valid_mask,
     GpuSearchResult* d_out_results,
     TraversalHop* d_out_hops,
     uint32_t* d_out_hop_counts,
     uint32_t max_hops_per_query,
+    cudaStream_t stream
+);
+
+void launch_hnsw_search_debug(
+    const HnswGpuGraph* graph,
+    const float* d_query,
+    uint32_t top_k,
+    uint32_t ef_search,
+    MetricType metric,
+    const uint32_t* d_valid_mask,
+    GpuSearchResult* d_out_results,
+    TraversalHop* d_out_hops,
+    uint32_t* d_out_hop_count,
+    uint32_t max_hops,
+    BeamStepRecord* d_out_steps,
+    uint32_t* d_out_step_count,
+    uint32_t max_steps,
     cudaStream_t stream
 );
 
