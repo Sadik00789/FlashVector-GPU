@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "gpu_vector_index"
-version = "0.1.0"
+version = "1.0.0"
 description = "Ultra-fast GPU vector search engine with CUDA sm_86 kernels, HNSW beam search, and IVF-PQ ADC"
 readme = "README.md"
 requires-python = ">=3.9"
