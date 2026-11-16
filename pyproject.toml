@@ -38,7 +38,7 @@ torch = [
 
 [tool.maturin]
 manifest-path = "crates/python/Cargo.toml"
-module-name = "gpu_vector_index"
+module-name = "gpu_vector_index.gpu_vector_index"
 python-source = "python"
 python-packages = ["flashvector_adapters"]
 features = ["pyo3/extension-module"]

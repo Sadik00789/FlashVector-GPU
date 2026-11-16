@@ -1,3 +1,7 @@
+// pyo3 0.22's `#[pymethods]` expansion trips clippy::useless_conversion on
+// `PyResult` return types; the conversion lives in generated code.
+#![allow(clippy::useless_conversion)]
+
 use pyo3::prelude::*;
 
 mod dlpack;
