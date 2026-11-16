@@ -1,8 +1,21 @@
 # FlashVector-GPU
 
-**GPU-Accelerated Approximate Nearest Neighbor Search**
+**GPU-Accelerated Vector Search & Hybrid Retrieval Engine**
 
-*Multi-arch CUDA (`sm_75` / `sm_80` / `sm_86` / `sm_89` / `sm_90`) · SIMT warp-cooperative HNSW · stride-257 shared-memory IVF-PQ ADC · Rust host layer · real-time 3D trajectory visualizer*
+*Multi-arch CUDA (`sm_75` / `sm_80` / `sm_86` / `sm_89` / `sm_90`) · CAGRA Fixed-Degree & Warp HNSW · IVF-PQ / IVF-SQ8 / IVF-RaBitQ / FP16 Tensor Core · On-Device Bitmask Filtering · Zero-Copy mmap Snapshots · CSR Sparse + GPU RRF Hybrid Search · Interactive 3D UMAP & Beam-Scrubber Visualizer*
+
+---
+
+## Key Capabilities
+
+- **Graph Traversal Kernels**: Warp-cooperative HNSW beam search plus flat fixed-degree CAGRA graph search (`cagra_search.cu`) with sub-warp parallel expansion and shared-memory `atomicCAS` visited hash tables.
+- **Quantization & Tensor Core Scan**: IVF-PQ (stride-257 conflict-free LUT + large-shortlist Stage-2 exact/mapped reranking), IVF-SQ8, IVF-RaBitQ (Fast Walsh-Hadamard transform + 4-bit warp bitplanes + `__popc`), and exact FP16 Tensor Core (`wmma`) scan.
+- **On-Device Metadata Filtering**: Packed Roaring-bitset masks (`filter.rs` / `d_valid_mask`) evaluated directly inside graph, IVF, FP16, and sparse kernels with zero host over-fetching.
+- **Zero-Copy Persistence & Live Mutations**: 64-byte-aligned `FLSHVEC1` `mmap` snapshots, non-blocking tombstone deletes, and concurrent secondary-stream GPU delta buffers with background logical-ID-preserving compaction.
+- **Hybrid Retrieval & Scale-Out**: CSR sparse dot-product kernel + on-device Reciprocal Rank Fusion (`cuda_rrf_fuse`), sub-millisecond server micro-batching (`batcher.rs`), multi-GPU NVLink/P2P sharding with device-side `cuda_merge_topk`, and thin Python adapters for **LangChain**, **LlamaIndex**, and **Qdrant**.
+- **FlashVector Studio**: Interactive 3D WebGL UI with **PCA / Parametric UMAP** cluster projections, **hop-by-hop beam scrubbing**, and **IVF probe telemetry**.
+
+> **Profiler Trace**: Nsight Systems timeline traces (`flashvector_timeline.nsys-rep`) are published under **GitHub Releases** rather than tracked in git history.
 
 ---
 
@@ -195,7 +208,7 @@ make build
 The Windows build requires the Visual Studio C++ build tools. If the system CUDA toolkit is not installed, the compiler and runtime available from PyPI can be used instead:
 
 ```powershell
-pip install nvidia-cuda-nvcc nvidia-cuda-runtime nvidia-cuda-crt nvidia-nvvm
+pip install nvidia-cuda-nvcc nvidia-cuda-runtime nvidia-cuda-crt nvidia-cuda-cccl nvidia-nvvm
 
 $cu = python -c "import nvidia.cuda_nvcc, pathlib; print(pathlib.Path(nvidia.cuda_nvcc.__file__).resolve().parents[1] / 'cu13')"
 $env:CUDA_HOME = "$cu"
@@ -213,9 +226,18 @@ npm --prefix web run build
 
 > `...\nvidia\cu13\bin\x86_64` provides `cudart64_13.dll` at test and runtime.
 
-### Python extension
+### CPU-only CI & Type-Check Mode
 
-Run `maturin develop` from an activated virtual environment:
+When building without a GPU runner (`FLASHVECTOR_CPU_ONLY=1`), `crates/engine/build.rs` compiles a lightweight host C stub (`crates/engine/cpu_stub/cpu_stub.c`) so the full Rust workspace, clippy, and host unit tests compile and run anywhere:
+
+```bash
+FLASHVECTOR_CPU_ONLY=1 cargo clippy --workspace --all-targets -- -D warnings
+FLASHVECTOR_CPU_ONLY=1 cargo test --workspace --exclude gpu_vector_index
+```
+
+### Python extension & RAG Adapters
+
+Build the PyO3 native extension and install the thin **LangChain**, **LlamaIndex**, and **Qdrant** adapters (`python/flashvector_adapters/`):
 
 ```bash
 python -m venv .venv
@@ -236,20 +258,23 @@ cargo test --workspace -- --nocapture
 cargo test --test cuda_sanity_test -- --nocapture
 cargo test --test e2e_search_test -- --nocapture
 
-# Python bindings (NumPy, CPU PyTorch, CUDA PyTorch)
-python -m pytest python/tests -v
+# Python bindings & RAG adapters (ruff, mypy, pytest)
+ruff check python/flashvector_adapters python/tests_adapters python/tests
+mypy python/flashvector_adapters
+python -m pytest python/tests python/tests_adapters -v
+
+# FlashVector Studio Web UI
+cd web && pnpm test && pnpm build
 
 # Memory/race/synchronization checks (Linux, full CUDA Toolkit)
 bash scripts/check_sanitizer.sh
 ```
 
-The current tree was validated on an NVIDIA RTX 3050 Laptop (`sm_86`) with CUDA 13.5: 4/4 CUDA sanity tests, 2/2 end-to-end tests (Recall@10 = 1.0000 on a 5,000-vector synthetic dataset), 7/7 Python binding tests, and REST snapshot/search plus WebSocket streaming smoke tests. `compute-sanitizer` ships with the full CUDA Toolkit and is not included in the PyPI compiler/runtime packages; on Windows it also requires the WDDM debugger interface to be enabled by running `EnableDebuggerInterface.bat` as Administrator.
-
 ---
 
-## Python & PyTorch Usage
+## Python, PyTorch & RAG Adapters Usage
 
-CUDA-resident tensors are consumed through their device pointers, so `search()` and `search_ivf()` avoid host round-trips.
+CUDA-resident tensors are consumed through their device pointers, so `search()` and `search_ivf()` avoid host round-trips, while supporting `search_cagra()`, `mode="pq"|"sq8"|"rabitq"`, `search_fp16()`, on-device `filter_mask`, live `add()` / `delete()` / `compact()`, `save()` / `load()` mmap snapshots, and `hybrid_search()`.
 
 ```python
 import torch
@@ -264,30 +289,29 @@ index = gpu_vector_index.FlashVectorGPU(
 index.build(dataset)
 
 labels, distances = index.search(query, top_k=10, ef_search=64)
-print(labels.shape)      # (10, 10)
-print(distances.shape)   # (10, 10)
-
-ivf_labels, ivf_distances = index.search_ivf(query, top_k=10, nprobe=8, rerank_k=32)
-print(ivf_distances.shape)  # (10, 10); distances are exact, not quantized
+cagra_labels, _ = index.search_cagra(query, top_k=10, ef_search=64)
+rabitq_labels, _ = index.search_ivf(query, top_k=10, nprobe=8, rerank_k=64, mode="rabitq")
 ```
 
-`rerank_k` is the shortlist size re-scored against full-precision vectors; pass `rerank_k=1` to skip re-ranking and read quantized ADC distances instead. Larger shortlists raise recall and cost throughput roughly linearly.
+See [python/flashvector_adapters/README.md](python/flashvector_adapters/README.md) for drop-in `FlashVectorQdrantClient`, `FlashVectorGPU` (LangChain), and `FlashVectorGPUVectorStore` (LlamaIndex) examples.
 
 ---
 
 ## Studio HTTP & WebSocket API
 
-The Axum gateway exposes REST endpoints for index management and a WebSocket stream for query telemetry.
+The Axum gateway batches concurrent non-debug queries via a sub-millisecond micro-batcher and streams debug telemetry (`beam_steps` / `probes`) over REST and WebSocket.
 
 | Method | Path | Description |
 | :--- | :--- | :--- |
-| `GET` | `/api/v1/stats` | Vector count, dimension, VRAM, and latency statistics |
-| `GET` | `/api/v1/vectors/3d` | PCA-projected 3D points and cluster assignments |
+| `GET` | `/api/v1/stats` | Vector count, dimension, VRAM, latency, and micro-batcher stats |
+| `GET` | `/api/v1/vectors/3d` | PCA or Parametric UMAP 3D points and cluster assignments |
+| `POST` | `/api/v1/projection` | Switch and recompute 3D projection (`pca` or `umap`) |
 | `POST` | `/api/v1/index` | Rebuild the index from generated or supplied vectors |
 | `POST` | `/api/v1/snapshot` | Build an index from an uploaded embedding snapshot |
-| `POST` | `/api/v1/search` | HNSW or IVF-PQ query with traversal-hop telemetry |
+| `POST` | `/api/v1/search` | Search (`hnsw`, `cagra`, `ivf_pq`, `ivf_sq8`, `ivf_rabitq`) + optional `debug` steps/probes |
+| `POST` | `/api/v1/hybrid_search` | Dense + sparse hybrid query fused with GPU Reciprocal Rank Fusion |
 | `GET` | `/api/v1/pq_distortion` | Per-cluster PQ reconstruction error for the heatmap |
-| `WS` | `/ws/stream` | Streaming query responses and latency telemetry |
+| `WS` | `/ws/stream` | Streaming query responses, debug telemetry, and latency telemetry |
 
 Frontend endpoints are configurable through `NEXT_PUBLIC_API_URL`, `NEXT_PUBLIC_WS_URL`, and `NEXT_PUBLIC_WS_PORT`; the visualizer selects `ws://` or `wss://` from the page protocol automatically.
 
