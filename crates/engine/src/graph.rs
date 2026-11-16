@@ -391,3 +391,268 @@ pub fn build_hnsw(
 
     (graph.adjacency, graph.degrees, entry_point)
 }
+
+/// Build a CAGRA-style flat, fixed-out-degree graph via NN-descent candidate
+/// expansion, RNG diversity pruning, and reverse-edge symmetrization.
+///
+/// Returns `(adjacency, graph_degree, entry_point, seed_nodes)` where
+/// `adjacency` has fixed stride `graph_degree` per node (`u32::MAX` sentinel
+/// in unused trailing slots when `num_nodes <= graph_degree`).
+pub fn build_cagra(
+    dataset: &[f32],
+    num_nodes: usize,
+    dim: usize,
+    graph_degree: usize,
+    seed_hnsw: Option<(&[u32], &[u32], u32)>,
+) -> (Vec<u32>, usize, u32, Vec<u32>) {
+    let degree = graph_degree.max(4);
+    if num_nodes == 0 {
+        return (Vec::new(), degree, 0, Vec::new());
+    }
+    if num_nodes == 1 {
+        return (vec![u32::MAX; degree], degree, 0, vec![0]);
+    }
+
+    let k_cand = (degree * 2).min(num_nodes - 1);
+
+    // 1. Initialize candidate neighborhoods (from HNSW + deterministic stride sampling, or random).
+    let mut knn_lists: Vec<Vec<(u32, f32)>> = (0..num_nodes)
+        .into_par_iter()
+        .map(|u| {
+            let u_vec = &dataset[u * dim..(u + 1) * dim];
+            let mut seen = Vec::with_capacity(k_cand * 2);
+            if let Some((h_adj, h_deg, m_max)) =
+                seed_hnsw.map(|(a, d, _)| (a, d, a.len() / num_nodes))
+            {
+                let deg = (h_deg[u] as usize).min(m_max);
+                for slot in 0..deg {
+                    let nb = h_adj[u * m_max + slot];
+                    if (nb as usize) < num_nodes && nb as usize != u {
+                        seen.push(nb);
+                    }
+                }
+            }
+            // Deterministic LCG fill so every node starts with diverse long-range candidates
+            let mut state = (u as u64)
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let target = k_cand.min(num_nodes - 1);
+            let mut attempts = 0usize;
+            while seen.len() < target && attempts < target * 4 {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let cand = ((state >> 32) as usize) % num_nodes;
+                if cand != u && !seen.contains(&(cand as u32)) {
+                    seen.push(cand as u32);
+                }
+                attempts += 1;
+            }
+            let mut scored: Vec<(u32, f32)> = seen
+                .into_iter()
+                .map(|nb| {
+                    let v = &dataset[nb as usize * dim..(nb as usize + 1) * dim];
+                    (nb, l2_sq(u_vec, v))
+                })
+                .collect();
+            scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+            scored.truncate(k_cand);
+            scored
+        })
+        .collect();
+
+    // 2. Two NN-descent neighbor-of-neighbor refinement passes
+    for _pass in 0..2 {
+        let prev = &knn_lists;
+        let next: Vec<Vec<(u32, f32)>> = (0..num_nodes)
+            .into_par_iter()
+            .map(|u| {
+                let u_vec = &dataset[u * dim..(u + 1) * dim];
+                let mut pool: Vec<(u32, f32)> = prev[u].clone();
+                let mut seen_ids: Vec<u32> = pool.iter().map(|x| x.0).collect();
+                seen_ids.sort_unstable();
+
+                for &(nb, _) in &prev[u] {
+                    for &(nb2, _) in &prev[nb as usize] {
+                        if nb2 as usize == u {
+                            continue;
+                        }
+                        if seen_ids.binary_search(&nb2).is_err() {
+                            if let Err(pos) = seen_ids.binary_search(&nb2) {
+                                seen_ids.insert(pos, nb2);
+                            }
+                            let v = &dataset[nb2 as usize * dim..(nb2 as usize + 1) * dim];
+                            pool.push((nb2, l2_sq(u_vec, v)));
+                        }
+                    }
+                }
+                pool.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+                pool.truncate(k_cand);
+                pool
+            })
+            .collect();
+        knn_lists = next;
+    }
+
+    // 3. Union NN-descent local neighborhood with original HNSW small-world bridges
+    //    so diversity pruning preserves navigable inter-cluster highway edges.
+    let pruned: Vec<Vec<(u32, f32)>> = knn_lists
+        .into_par_iter()
+        .enumerate()
+        .map(|(u, mut cands)| {
+            if let Some((h_adj, h_deg, _)) = seed_hnsw {
+                let m_max = h_adj.len() / num_nodes;
+                let deg = (h_deg[u] as usize).min(m_max);
+                let u_vec = &dataset[u * dim..(u + 1) * dim];
+                for slot in 0..deg {
+                    let nb = h_adj[u * m_max + slot];
+                    if (nb as usize) < num_nodes
+                        && nb as usize != u
+                        && !cands.iter().any(|&(id, _)| id == nb)
+                    {
+                        let v = &dataset[nb as usize * dim..(nb as usize + 1) * dim];
+                        cands.push((nb, l2_sq(u_vec, v)));
+                    }
+                }
+            }
+            let mut diverse = select_neighbors(dataset, dim, cands.clone(), degree);
+            // Guarantee explicit small-world bridge slots alongside tight kNN edges
+            if let Some((h_adj, h_deg, _)) = seed_hnsw {
+                let m_max = h_adj.len() / num_nodes;
+                let deg = (h_deg[u] as usize).min(m_max);
+                let u_vec = &dataset[u * dim..(u + 1) * dim];
+                let bridge_reserve = (degree / 4).max(2);
+                let local_keep = degree.saturating_sub(bridge_reserve);
+                if diverse.len() > local_keep {
+                    let mut long_bridges = Vec::new();
+                    for slot in 0..deg {
+                        let nb = h_adj[u * m_max + slot];
+                        if (nb as usize) < num_nodes
+                            && nb as usize != u
+                            && !diverse[..local_keep].iter().any(|&(id, _)| id == nb)
+                        {
+                            let v = &dataset[nb as usize * dim..(nb as usize + 1) * dim];
+                            long_bridges.push((nb, l2_sq(u_vec, v)));
+                        }
+                    }
+                    // Retain farthest diverse HNSW edges to span disconnected Voronoi clusters
+                    long_bridges.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+                    if !long_bridges.is_empty() {
+                        diverse.truncate(local_keep);
+                        for bridge in long_bridges.into_iter().take(bridge_reserve) {
+                            diverse.push(bridge);
+                        }
+                    }
+                }
+            }
+            diverse
+        })
+        .collect();
+
+    // 4. Pack forward edges and admit pruned reverse edges up to fixed `degree`
+    let mut adjacency = vec![u32::MAX; num_nodes * degree];
+    let mut edge_dists = vec![f32::INFINITY; num_nodes * degree];
+    let mut counts = vec![0usize; num_nodes];
+
+    for (u, list) in pruned.iter().enumerate() {
+        let base = u * degree;
+        for (slot, &(v, dist)) in list.iter().take(degree).enumerate() {
+            adjacency[base + slot] = v;
+            edge_dists[base + slot] = dist;
+            counts[u] = slot + 1;
+        }
+    }
+
+    // Symmetrize reverse edges while respecting the fixed degree cap
+    for (u, list) in pruned.iter().enumerate() {
+        for &(v_u32, dist) in list {
+            let v = v_u32 as usize;
+            let v_base = v * degree;
+            let v_cnt = counts[v];
+            if adjacency[v_base..v_base + v_cnt].contains(&(u as u32)) {
+                continue;
+            }
+            if v_cnt < degree {
+                adjacency[v_base + v_cnt] = u as u32;
+                edge_dists[v_base + v_cnt] = dist;
+                counts[v] += 1;
+            } else {
+                // Evict the farthest edge if the incoming reverse edge is closer
+                let mut worst_slot = 0usize;
+                let mut worst_dist = edge_dists[v_base];
+                for slot in 1..degree {
+                    if edge_dists[v_base + slot] > worst_dist {
+                        worst_dist = edge_dists[v_base + slot];
+                        worst_slot = slot;
+                    }
+                }
+                if dist < worst_dist {
+                    adjacency[v_base + worst_slot] = u as u32;
+                    edge_dists[v_base + worst_slot] = dist;
+                }
+            }
+        }
+    }
+
+    // 5. Select centroid entry point + diverse spread seeds for multi-start traversal
+    let entry_point = if let Some((_, _, ep)) = seed_hnsw {
+        ep
+    } else {
+        let mut centroid = vec![0.0f32; dim];
+        for node in 0..num_nodes {
+            let vector = &dataset[node * dim..(node + 1) * dim];
+            for d in 0..dim {
+                centroid[d] += vector[d];
+            }
+        }
+        let inv = 1.0 / num_nodes as f32;
+        centroid.iter_mut().for_each(|value| *value *= inv);
+        let mut ep = 0u32;
+        let mut best_dist = f32::INFINITY;
+        for node in 0..num_nodes {
+            let dist = l2_sq(&centroid, &dataset[node * dim..(node + 1) * dim]);
+            if dist < best_dist {
+                best_dist = dist;
+                ep = node as u32;
+            }
+        }
+        ep
+    };
+
+    let num_seeds = num_nodes.min(32);
+    let mut seeds = Vec::with_capacity(num_seeds);
+    seeds.push(entry_point);
+    let step = (num_nodes / num_seeds.max(1)).max(1);
+    let mut cursor = 0usize;
+    while seeds.len() < num_seeds && cursor < num_nodes {
+        let cand = cursor as u32;
+        if !seeds.contains(&cand) {
+            seeds.push(cand);
+        }
+        cursor += step;
+    }
+
+    (adjacency, degree, entry_point, seeds)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_build_cagra_fixed_degree_and_seeds() {
+        let dim = 16;
+        let n = 64;
+        let data: Vec<f32> = (0..n * dim).map(|i| ((i * 7 % 53) as f32) * 0.05).collect();
+        let (adj, deg, ep, seeds) = build_cagra(&data, n, dim, 16, None);
+        assert_eq!(deg, 16);
+        assert_eq!(adj.len(), n * 16);
+        assert!((ep as usize) < n);
+        assert!(!seeds.is_empty());
+        assert_eq!(seeds[0], ep);
+        // Every node should have at least one valid neighbor
+        for u in 0..n {
+            assert!(adj[u * 16..(u + 1) * 16].iter().any(|&v| (v as usize) < n));
+        }
+    }
+}
