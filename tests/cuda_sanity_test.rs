@@ -5,9 +5,16 @@ use engine::{
 
 #[test]
 fn test_gpu_initialization_and_memory() {
-    assert!(init_gpu(0).is_ok(), "CUDA initialization must succeed on device 0");
+    assert!(
+        init_gpu(0).is_ok(),
+        "CUDA initialization must succeed on device 0"
+    );
     let (free_b, total_b) = engine::gpu_get_memory().expect("Should read GPU memory");
-    println!("GPU VRAM - Free: {} MB, Total: {} MB", free_b / (1024 * 1024), total_b / (1024 * 1024));
+    println!(
+        "GPU VRAM - Free: {} MB, Total: {} MB",
+        free_b / (1024 * 1024),
+        total_b / (1024 * 1024)
+    );
     assert!(total_b > 0);
 }
 
@@ -22,7 +29,9 @@ fn test_pinned_device_memory_transfers() {
     let mut h_out = PinnedBuffer::new(data.len()).unwrap();
 
     d_buf.copy_from_pinned_async(&h_buf, stream.raw()).unwrap();
-    d_buf.copy_to_pinned_async(&mut h_out, stream.raw()).unwrap();
+    d_buf
+        .copy_to_pinned_async(&mut h_out, stream.raw())
+        .unwrap();
     stream.sync().unwrap();
 
     for i in 0..data.len() {
@@ -65,10 +74,13 @@ fn test_warp_distance_reduction_correctness() {
         MetricType::L2,
         d_out.as_mut_ptr(),
         stream.raw(),
-    ).unwrap();
+    )
+    .unwrap();
 
     let mut gpu_dists = vec![0.0f32; num_queries * num_vectors];
-    d_out.copy_to_host_async(&mut gpu_dists, stream.raw()).unwrap();
+    d_out
+        .copy_to_host_async(&mut gpu_dists, stream.raw())
+        .unwrap();
     stream.sync().unwrap();
 
     // Verify against CPU floating-point baseline with relative error tolerance
@@ -77,14 +89,22 @@ fn test_warp_distance_reduction_correctness() {
             let q_vec = &queries[q * dim..(q + 1) * dim];
             let v_vec = &dataset[v * dim..(v + 1) * dim];
 
-            let cpu_dist: f32 = q_vec.iter().zip(v_vec.iter()).map(|(&a, &b)| (a - b) * (a - b)).sum();
+            let cpu_dist: f32 = q_vec
+                .iter()
+                .zip(v_vec.iter())
+                .map(|(&a, &b)| (a - b) * (a - b))
+                .sum();
             let gpu_dist = gpu_dists[q * num_vectors + v];
 
             let rel_diff = (cpu_dist - gpu_dist).abs() / cpu_dist.max(1.0);
             assert!(
                 rel_diff < 1e-4,
                 "Relative distance error too high at q={}, v={}: CPU={}, GPU={}, rel_diff={}",
-                q, v, cpu_dist, gpu_dist, rel_diff
+                q,
+                v,
+                cpu_dist,
+                gpu_dist,
+                rel_diff
             );
         }
     }
@@ -113,17 +133,25 @@ fn test_bitonic_sort_correctness() {
         d_v_out.as_mut_ptr(),
         keys_in.len() as u32,
         stream.raw(),
-    ).unwrap();
+    )
+    .unwrap();
 
     let mut keys_out = vec![0.0f32; keys_in.len()];
     let mut vals_out = vec![0u32; vals_in.len()];
 
-    d_k_out.copy_to_host_async(&mut keys_out, stream.raw()).unwrap();
-    d_v_out.copy_to_host_async(&mut vals_out, stream.raw()).unwrap();
+    d_k_out
+        .copy_to_host_async(&mut keys_out, stream.raw())
+        .unwrap();
+    d_v_out
+        .copy_to_host_async(&mut vals_out, stream.raw())
+        .unwrap();
     stream.sync().unwrap();
 
     // Verify sorted ascending
     for i in 1..keys_in.len() {
-        assert!(keys_out[i] >= keys_out[i - 1], "Bitonic sort failed to sort ascending");
+        assert!(
+            keys_out[i] >= keys_out[i - 1],
+            "Bitonic sort failed to sort ascending"
+        );
     }
 }

@@ -115,7 +115,9 @@ impl Graph {
         frontier.push(Reverse((Key(entry_dist), entry)));
 
         while let Some(Reverse((Key(current_dist), node))) = frontier.pop() {
-            if results.len() >= ef && current_dist > results.peek().map(|r| r.0 .0).unwrap_or(f32::INFINITY) {
+            if results.len() >= ef
+                && current_dist > results.peek().map(|r| r.0 .0).unwrap_or(f32::INFINITY)
+            {
                 break;
             }
 
@@ -133,7 +135,9 @@ impl Graph {
                 let vector = &dataset[idx * dim..(idx + 1) * dim];
                 let dist = l2_sq(query, vector);
 
-                if results.len() < ef || dist < results.peek().map(|r| r.0 .0).unwrap_or(f32::INFINITY) {
+                if results.len() < ef
+                    || dist < results.peek().map(|r| r.0 .0).unwrap_or(f32::INFINITY)
+                {
                     results.push((Key(dist), neighbor));
                     frontier.push(Reverse((Key(dist), neighbor)));
                     if results.len() > ef {
@@ -268,8 +272,15 @@ impl Graph {
         workspace: &mut Workspace,
     ) {
         let query = &dataset[node * dim..(node + 1) * dim];
-        let candidates =
-            self.beam_search(dataset, dim, prefix, entry, query, ef_construction, workspace);
+        let candidates = self.beam_search(
+            dataset,
+            dim,
+            prefix,
+            entry,
+            query,
+            ef_construction,
+            workspace,
+        );
         let selected = select_neighbors(dataset, dim, candidates, m);
 
         let start = node * self.m_max;
@@ -330,15 +341,8 @@ pub fn build_hnsw(
                 || Workspace::new(num_nodes),
                 |workspace, node| {
                     let query = &dataset[node * dim..(node + 1) * dim];
-                    let candidates = graph.beam_search(
-                        dataset,
-                        dim,
-                        start,
-                        entry,
-                        query,
-                        ef,
-                        workspace,
-                    );
+                    let candidates =
+                        graph.beam_search(dataset, dim, start, entry, query, ef, workspace);
                     select_neighbors(dataset, dim, candidates, m_max)
                 },
             )

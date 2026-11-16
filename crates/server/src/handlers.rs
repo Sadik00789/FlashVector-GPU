@@ -1,4 +1,3 @@
-use std::time::Instant;
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
@@ -10,12 +9,13 @@ use axum::{
 };
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
+use std::time::Instant;
 use tracing::info;
 
+use crate::state::AppState;
 use engine::{
     gpu_get_memory, GpuSearchResult, GpuVectorIndex, IndexConfig, LatencyStats, Vector3D,
 };
-use crate::state::AppState;
 
 #[derive(Debug, Deserialize)]
 pub struct SearchRequest {
@@ -85,7 +85,11 @@ pub struct PqDistortionResponse {
 pub async fn handle_stats(State(state): State<AppState>) -> Json<IndexStatsResponse> {
     let (num_vectors, dim, stats) = {
         let index = state.index.read();
-        (index.num_vectors(), index.dim(), index.metrics().get_stats())
+        (
+            index.num_vectors(),
+            index.dim(),
+            index.metrics().get_stats(),
+        )
     };
 
     let (free_b, total_b) = gpu_get_memory().unwrap_or((0, 0));
@@ -284,7 +288,9 @@ pub async fn handle_search(
     let dim = { state.index.read().dim() };
     let query = payload.query.unwrap_or_else(|| {
         let mut rng = rand::thread_rng();
-        (0..dim).map(|_| rand::Rng::gen_range(&mut rng, -1.0f32..1.0f32)).collect()
+        (0..dim)
+            .map(|_| rand::Rng::gen_range(&mut rng, -1.0f32..1.0f32))
+            .collect()
     });
 
     let points_3d = state.projected_points_3d.read().clone();
@@ -293,10 +299,14 @@ pub async fn handle_search(
         let index = state.index.read();
         let start = Instant::now();
         let (results, hops) = if use_ivf {
-            let res = index.search_ivf_pq(&query, top_k, nprobe).unwrap_or_default();
+            let res = index
+                .search_ivf_pq(&query, top_k, nprobe)
+                .unwrap_or_default();
             (res, Vec::new())
         } else {
-            index.search_with_trajectory(&query, top_k, ef_search).unwrap_or_default()
+            index
+                .search_with_trajectory(&query, top_k, ef_search)
+                .unwrap_or_default()
         };
         let latency_us = start.elapsed().as_secs_f64() * 1_000_000.0;
         let stats = index.metrics().get_stats();
@@ -309,11 +319,19 @@ pub async fn handle_search(
             let from_pos = points_3d
                 .get(h.from_node as usize)
                 .cloned()
-                .unwrap_or(Vector3D { x: 0.0, y: 0.0, z: 0.0 });
+                .unwrap_or(Vector3D {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 0.0,
+                });
             let to_pos = points_3d
                 .get(h.to_node as usize)
                 .cloned()
-                .unwrap_or(Vector3D { x: 0.0, y: 0.0, z: 0.0 });
+                .unwrap_or(Vector3D {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 0.0,
+                });
 
             TraversalHop3D {
                 step: h.step,
@@ -356,7 +374,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
                         let query = req.query.unwrap_or_else(|| {
                             let mut rng = rand::thread_rng();
-                            (0..dim).map(|_| rand::Rng::gen_range(&mut rng, -1.0f32..1.0f32)).collect()
+                            (0..dim)
+                                .map(|_| rand::Rng::gen_range(&mut rng, -1.0f32..1.0f32))
+                                .collect()
                         });
 
                         let points_3d = state.projected_points_3d.read().clone();
@@ -364,7 +384,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         let (results, hops, latency_us, stats) = {
                             let index = state.index.read();
                             let start = Instant::now();
-                            let (results, hops) = index.search_with_trajectory(&query, top_k, ef_search).unwrap_or_default();
+                            let (results, hops) = index
+                                .search_with_trajectory(&query, top_k, ef_search)
+                                .unwrap_or_default();
                             let latency_us = start.elapsed().as_secs_f64() * 1_000_000.0;
                             let stats = index.metrics().get_stats();
                             (results, hops, latency_us, stats)
@@ -376,11 +398,18 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 let from_pos = points_3d
                                     .get(h.from_node as usize)
                                     .cloned()
-                                    .unwrap_or(Vector3D { x: 0.0, y: 0.0, z: 0.0 });
-                                let to_pos = points_3d
-                                    .get(h.to_node as usize)
-                                    .cloned()
-                                    .unwrap_or(Vector3D { x: 0.0, y: 0.0, z: 0.0 });
+                                    .unwrap_or(Vector3D {
+                                        x: 0.0,
+                                        y: 0.0,
+                                        z: 0.0,
+                                    });
+                                let to_pos = points_3d.get(h.to_node as usize).cloned().unwrap_or(
+                                    Vector3D {
+                                        x: 0.0,
+                                        y: 0.0,
+                                        z: 0.0,
+                                    },
+                                );
 
                                 TraversalHop3D {
                                     step: h.step,

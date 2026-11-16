@@ -124,7 +124,10 @@ pub struct HnswGpuGraph {
 
 extern "C" {
     fn cuda_init_device(device_id: libc::c_int) -> libc::c_int;
-    fn cuda_get_device_memory(free_bytes: *mut libc::size_t, total_bytes: *mut libc::size_t) -> libc::c_int;
+    fn cuda_get_device_memory(
+        free_bytes: *mut libc::size_t,
+        total_bytes: *mut libc::size_t,
+    ) -> libc::c_int;
     fn cuda_device_synchronize() -> libc::c_int;
 
     fn cuda_malloc_device(ptr: *mut *mut libc::c_void, bytes: libc::size_t) -> libc::c_int;
@@ -132,8 +135,18 @@ extern "C" {
     fn cuda_malloc_host(ptr: *mut *mut libc::c_void, bytes: libc::size_t) -> libc::c_int;
     fn cuda_free_host(ptr: *mut libc::c_void) -> libc::c_int;
 
-    fn cuda_memcpy_h2d_async(dst: *mut libc::c_void, src: *const libc::c_void, bytes: libc::size_t, stream: *mut libc::c_void) -> libc::c_int;
-    fn cuda_memcpy_d2h_async(dst: *mut libc::c_void, src: *const libc::c_void, bytes: libc::size_t, stream: *mut libc::c_void) -> libc::c_int;
+    fn cuda_memcpy_h2d_async(
+        dst: *mut libc::c_void,
+        src: *const libc::c_void,
+        bytes: libc::size_t,
+        stream: *mut libc::c_void,
+    ) -> libc::c_int;
+    fn cuda_memcpy_d2h_async(
+        dst: *mut libc::c_void,
+        src: *const libc::c_void,
+        bytes: libc::size_t,
+        stream: *mut libc::c_void,
+    ) -> libc::c_int;
 
     fn cuda_create_stream(stream: *mut *mut libc::c_void) -> libc::c_int;
     fn cuda_destroy_stream(stream: *mut libc::c_void) -> libc::c_int;
@@ -454,16 +467,8 @@ pub fn gpu_bitonic_sort_test(
     n: u32,
     stream: *mut libc::c_void,
 ) -> Result<(), CudaError> {
-    let ret = unsafe {
-        cuda_bitonic_sort_test(
-            d_keys_in,
-            d_vals_in,
-            d_keys_out,
-            d_vals_out,
-            n,
-            stream,
-        )
-    };
+    let ret =
+        unsafe { cuda_bitonic_sort_test(d_keys_in, d_vals_in, d_keys_out, d_vals_out, n, stream) };
     if ret == 0 {
         Ok(())
     } else {

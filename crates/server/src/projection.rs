@@ -83,9 +83,15 @@ impl PcaProjector3D {
         assert_eq!(vec.len(), self.dim);
         let centered: Vec<f32> = (0..self.dim).map(|d| vec[d] - self.mean[d]).collect();
 
-        let x: f32 = (0..self.dim).map(|d| centered[d] * self.components[0][d]).sum();
-        let y: f32 = (0..self.dim).map(|d| centered[d] * self.components[1][d]).sum();
-        let z: f32 = (0..self.dim).map(|d| centered[d] * self.components[2][d]).sum();
+        let x: f32 = (0..self.dim)
+            .map(|d| centered[d] * self.components[0][d])
+            .sum();
+        let y: f32 = (0..self.dim)
+            .map(|d| centered[d] * self.components[1][d])
+            .sum();
+        let z: f32 = (0..self.dim)
+            .map(|d| centered[d] * self.components[2][d])
+            .sum();
 
         Vector3D {
             x: x * self.scale,

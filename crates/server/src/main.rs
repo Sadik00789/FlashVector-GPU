@@ -1,8 +1,8 @@
-use std::net::SocketAddr;
 use axum::{
     routing::{get, post},
     Router,
 };
+use std::net::SocketAddr;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 use tracing::info;
@@ -12,8 +12,8 @@ mod projection;
 mod state;
 
 use handlers::{
-    handle_get_3d_vectors, handle_index, handle_load_snapshot, handle_pq_distortion,
-    handle_search, handle_stats, handle_ws_stream,
+    handle_get_3d_vectors, handle_index, handle_load_snapshot, handle_pq_distortion, handle_search,
+    handle_stats, handle_ws_stream,
 };
 use state::AppState;
 

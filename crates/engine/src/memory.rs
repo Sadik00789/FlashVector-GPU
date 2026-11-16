@@ -1,10 +1,10 @@
-use std::marker::PhantomData;
-use std::ops::{Deref, DerefMut, Index, IndexMut};
-use std::ptr::NonNull;
 use crate::ffi::{
     gpu_free_device, gpu_free_host, gpu_malloc_device, gpu_malloc_host, gpu_memcpy_d2h_async,
     gpu_memcpy_h2d_async, CudaError,
 };
+use std::marker::PhantomData;
+use std::ops::{Deref, DerefMut, Index, IndexMut};
+use std::ptr::NonNull;
 
 /// RAII Page-Locked Pinned Host Memory Buffer for fast zero-copy / async DMA transfers
 pub struct PinnedBuffer<T> {

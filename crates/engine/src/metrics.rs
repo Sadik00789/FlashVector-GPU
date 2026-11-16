@@ -1,9 +1,9 @@
+use crate::ffi::GpuSearchResult;
+use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-use parking_lot::Mutex;
-use serde::{Deserialize, Serialize};
-use crate::ffi::GpuSearchResult;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LatencyStats {
@@ -40,7 +40,8 @@ impl MetricsTracker {
             lats.drain(0..50_000);
         }
         lats.push(us);
-        self.total_queries.fetch_add(batch_size as u64, Ordering::Relaxed);
+        self.total_queries
+            .fetch_add(batch_size as u64, Ordering::Relaxed);
     }
 
     pub fn get_stats(&self) -> LatencyStats {
@@ -124,7 +125,11 @@ impl RecallEvaluator {
             })
             .collect();
 
-        dists.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap_or(std::cmp::Ordering::Equal));
+        dists.sort_by(|a, b| {
+            a.distance
+                .partial_cmp(&b.distance)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         dists.truncate(top_k);
         dists
     }

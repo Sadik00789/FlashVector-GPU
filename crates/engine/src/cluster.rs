@@ -1,12 +1,12 @@
-use rayon::prelude::*;
 use rand::seq::SliceRandom;
 use rand::Rng;
+use rayon::prelude::*;
 
 #[derive(Debug, Clone)]
 pub struct KMeansResult {
-    pub centroids: Vec<f32>,      // [k * dim]
-    pub assignments: Vec<u32>,    // [num_vectors]
-    pub cluster_sizes: Vec<usize>,// [k]
+    pub centroids: Vec<f32>,       // [k * dim]
+    pub assignments: Vec<u32>,     // [num_vectors]
+    pub cluster_sizes: Vec<usize>, // [k]
     pub k: usize,
     pub dim: usize,
 }
@@ -25,12 +25,7 @@ impl KMeans {
             .sum()
     }
 
-    pub fn fit(
-        vectors: &[f32],
-        dim: usize,
-        k: usize,
-        max_iters: usize,
-    ) -> KMeansResult {
+    pub fn fit(vectors: &[f32], dim: usize, k: usize, max_iters: usize) -> KMeansResult {
         let num_vectors = vectors.len() / dim;
         assert!(num_vectors >= k, "Number of vectors must be >= k");
 
@@ -77,8 +72,7 @@ impl KMeans {
                 .par_iter_mut()
                 .zip(seed.par_iter())
                 .for_each(|(best, &idx)| {
-                    let candidate =
-                        Self::l2_sq(&vectors[idx * dim..(idx + 1) * dim], &last);
+                    let candidate = Self::l2_sq(&vectors[idx * dim..(idx + 1) * dim], &last);
                     if candidate < *best {
                         *best = candidate;
                     }
@@ -171,8 +165,9 @@ impl KMeans {
                             furthest_vec_idx = sample_idx;
                         }
                     }
-                    new_centroids[c * dim..(c + 1) * dim]
-                        .copy_from_slice(&vectors[furthest_vec_idx * dim..(furthest_vec_idx + 1) * dim]);
+                    new_centroids[c * dim..(c + 1) * dim].copy_from_slice(
+                        &vectors[furthest_vec_idx * dim..(furthest_vec_idx + 1) * dim],
+                    );
                 }
             }
 
@@ -204,12 +199,7 @@ pub struct ProductQuantizer {
 }
 
 impl ProductQuantizer {
-    pub fn train(
-        vectors: &[f32],
-        dim: usize,
-        m_pq: usize,
-        iters: usize,
-    ) -> Self {
+    pub fn train(vectors: &[f32], dim: usize, m_pq: usize, iters: usize) -> Self {
         assert_eq!(dim % m_pq, 0, "Dimension must be divisible by m_pq");
         let sub_dim = dim / m_pq;
         let num_vectors = vectors.len() / dim;
@@ -228,7 +218,11 @@ impl ProductQuantizer {
                     sub_vectors.extend_from_slice(&vectors[start..start + sub_dim]);
                 }
 
-                let k_actual = if num_vectors < num_centroids { num_vectors } else { num_centroids };
+                let k_actual = if num_vectors < num_centroids {
+                    num_vectors
+                } else {
+                    num_centroids
+                };
                 let res = KMeans::fit(&sub_vectors, sub_dim, k_actual, iters);
 
                 sub_codebook[..k_actual * sub_dim].copy_from_slice(&res.centroids);
@@ -268,11 +262,16 @@ impl ProductQuantizer {
                     let mut best_code = 0u8;
 
                     for c in 0..256 {
-                        let centroid = &self.codebooks[cb_offset + c * self.sub_dim..cb_offset + (c + 1) * self.sub_dim];
-                        let dist: f32 = sub_vec.iter().zip(centroid.iter()).map(|(&x, &y)| {
-                            let d = x - y;
-                            d * d
-                        }).sum();
+                        let centroid = &self.codebooks
+                            [cb_offset + c * self.sub_dim..cb_offset + (c + 1) * self.sub_dim];
+                        let dist: f32 = sub_vec
+                            .iter()
+                            .zip(centroid.iter())
+                            .map(|(&x, &y)| {
+                                let d = x - y;
+                                d * d
+                            })
+                            .sum();
 
                         if dist < min_dist {
                             min_dist = dist;

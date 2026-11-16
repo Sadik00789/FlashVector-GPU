@@ -1,10 +1,10 @@
-use std::sync::Arc;
 use parking_lot::RwLock;
 use rand_distr::{Distribution, Normal};
+use std::sync::Arc;
 use tracing::info;
 
-use engine::{GpuVectorIndex, IndexConfig, Vector3D};
 use crate::projection::PcaProjector3D;
+use engine::{GpuVectorIndex, IndexConfig, Vector3D};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -42,8 +42,16 @@ impl AppState {
         state
     }
 
-    pub fn generate_and_index_clustered(&self, num_vectors: usize, dim: usize, num_clusters: usize) {
-        info!("Generating synthetic clustered dataset: {} vectors, {} dim, {} clusters", num_vectors, dim, num_clusters);
+    pub fn generate_and_index_clustered(
+        &self,
+        num_vectors: usize,
+        dim: usize,
+        num_clusters: usize,
+    ) {
+        info!(
+            "Generating synthetic clustered dataset: {} vectors, {} dim, {} clusters",
+            num_vectors, dim, num_clusters
+        );
         let mut rng = rand::thread_rng();
         let normal = Normal::new(0.0, 0.15).unwrap();
 

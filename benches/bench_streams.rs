@@ -15,8 +15,12 @@ fn bench_stream_transfers(c: &mut Criterion) {
     group.bench_function("pinned_h2d_d2h_async_4mb", |b| {
         b.iter(|| {
             let stream = pool.get_stream();
-            d_buf.copy_from_pinned_async(black_box(&h_buf), stream.raw()).unwrap();
-            d_buf.copy_to_pinned_async(black_box(&mut h_out), stream.raw()).unwrap();
+            d_buf
+                .copy_from_pinned_async(black_box(&h_buf), stream.raw())
+                .unwrap();
+            d_buf
+                .copy_to_pinned_async(black_box(&mut h_out), stream.raw())
+                .unwrap();
             stream.sync().unwrap();
         })
     });
