@@ -21,15 +21,23 @@
 
 ## Real-Time 3D Visualizer & Trajectory Streamer
 
-FlashVector-GPU includes an interactive Three.js/WebGL visualizer backed by an Axum WebSocket stream. It renders graph traversal hops, Voronoi cluster partitions, top-k targets, and per-query telemetry in real time, with a playback scrubber for hop-by-hop replay and `InstancedMesh` rendering for datasets above 100k points.
+FlashVector-GPU includes an interactive Three.js/WebGL Studio backed by an Axum WebSocket stream and sub-millisecond query micro-batcher. It renders graph traversal hops, Parametric UMAP / PCA 3D clusters, Voronoi centroids, top-k targets, and a live `StepPanel` scrubber for stepping backward and forward through beam queue iterations and IVF probe lists.
 
 ### 1. Warp-Cooperative HNSW Graph Beam Search
 ![FlashVector-GPU HNSW Warp Beam Traversal](assets/visualizer_hnsw_beam.png)
-*Figure 1: Real-time HNSW beam search routing across 10,000 vectors with `efSearch = 240` and `top_k = 46`, tracing animated 3D traversal rays across 960 recorded hops from the entry point to the top-k nearest neighbors.*
+*Figure 1: HNSW warp-cooperative beam search routing across 10,000 vectors (`efSearch = 240`, `top_k = 46`), tracing animated 3D traversal rays across 960 recorded hops from the entry point to the top-k nearest neighbors.*
 
-### 2. IVF-PQ Dynamic Shared-Memory ADC Lookup
+### 2. CAGRA Flat Fixed-Degree Graph + Parametric UMAP 3D & Beam Queue Scrubber
+![FlashVector-GPU CAGRA UMAP Beam Scrubber](assets/visualizer_cagra_umap.png)
+*Figure 2: CAGRA flat fixed-degree traversal rendered over a topology-preserving Parametric UMAP 3D projection (`10,000` × 128-D vectors), showing live `BEAM QUEUE` candidate states (`Beam iteration 31 / 64`, `Expanded ID 8888`, `5 evals`, `13.13 ms`).*
+
+### 3. IVF-RaBitQ Probe Scrubbing (UMAP Projection)
+![FlashVector-GPU IVF-RaBitQ Probe Scrubber](assets/visualizer_ivf_rabitq.png)
+*Figure 3: IVF-RaBitQ query (`nprobe = 8`, `7.32 ms`) with live Voronoi probe scrubbing in the right-hand `IVF PROBE` inspector (`Probe 8 / 8`, `Cluster 3`, `centroid dist 125.4087`, `list length 625`).*
+
+### 4. IVF-PQ Dynamic Shared-Memory ADC Lookup
 ![FlashVector-GPU IVF-PQ ADC Search](assets/visualizer_ivf_pq.png)
-*Figure 2: IVF-PQ asymmetric distance computation with `nprobe = 28`, scoring probed Voronoi partitions and decompressing quantized vector codes in dynamic shared memory, then re-scoring the shortlist against full-precision vectors.*
+*Figure 4: IVF-PQ asymmetric distance computation with `nprobe = 28`, scoring probed Voronoi partitions and decompressing quantized vector codes in dynamic shared memory before exact Stage-2 re-scoring.*
 
 ---
 
@@ -143,7 +151,39 @@ Graph construction uses the HNSW diversity heuristic rather than plain k-nearest
 
 ---
 
-## Benchmark Results (RTX 3050 Laptop, `sm_86`, SIFT1M)
+## Benchmark Results (RTX 3050 Laptop, `sm_86`)
+
+### Multi-Engine v1.0.0 Suite (50,000 × 128-D + 512-D FP16 Tensor Core)
+
+Measured directly on NVIDIA RTX 3050 Laptop (`sm_86`) with CUDA 13.5 via [`scripts/run_benchmarks.py`](scripts/run_benchmarks.py) (`N = 50,000`, `D = 128`, `64` clusters, `500` queries, `top_k = 10`, `nlist = 128`, `m = 32`, `ef_construction = 128`; best of 5 batched dispatches, build time `44.24 s`):
+
+![FlashVector-GPU v1.0.0 Multi-Engine Pareto Frontier](assets/benchmark_pareto.png)
+
+| Engine | Configuration | Recall@10 | QPS (queries/sec) | Mean Latency |
+| :--- | :--- | :---: | :---: | :---: |
+| **IVF-RaBitQ** | `nprobe = 16`, Stage-2 `rerank = 512` | **1.0000** | **63,670.7** | **15.71 µs** |
+| **IVF-RaBitQ** | `nprobe = 16`, Stage-2 `rerank = 128` | 0.9708 | 46,464.1 | 21.52 µs |
+| **IVF-RaBitQ** | `nprobe = 16`, Stage-1 `rerank = 32` | 0.7484 | 18,382.5 | 54.40 µs |
+| **IVF-PQ** | `nprobe = 16`, Stage-2 `rerank = 512` | **0.9994** | **42,382.6** | **23.59 µs** |
+| **IVF-PQ** | `nprobe = 16`, Stage-2 `rerank = 128` | 0.9076 | 35,057.0 | 28.52 µs |
+| **IVF-PQ** | `nprobe = 16`, Stage-1 `rerank = 32` | 0.6018 | 17,270.9 | 57.90 µs |
+| **IVF-PQ** | `nprobe = 16`, `rerank = 1` (ADC only) | 0.3226 | 62,934.2 | 15.89 µs |
+| **IVF-SQ8** | `nprobe = 16`, Stage-2 `rerank = 512` | **1.0000** | **18,040.3** | **55.43 µs** |
+| **IVF-SQ8** | `nprobe = 16`, `rerank = 32` | 1.0000 | 15,398.6 | 64.94 µs |
+| **Warp HNSW** | `efSearch = 32` | 0.8734 | 60,664.2 | 16.48 µs |
+| **Warp HNSW** | `efSearch = 64` | 0.9796 | 25,317.7 | 39.50 µs |
+| **Warp HNSW** | `efSearch = 128` | **0.9996** | **9,347.9** | **106.98 µs** |
+| **Warp HNSW** | `efSearch = 256` | 0.9998 | 2,969.3 | 336.78 µs |
+| **CAGRA** | `efSearch = 32` / `64` / `128` | 0.7200 / 0.8496 / **0.9498** | 10,567.5 / 16,161.1 / 7,794.9 | 94.63 / 61.88 / 128.29 µs |
+| **FP16 Tensor Core** | `wmma 16×16×16` (`50k × 128-D`) | **0.9964** | **16,971.2** | **58.92 µs** |
+| **FP16 Tensor Core** | `wmma 16×16×16` (`10k × 512-D`, `256` q) | **0.9977** | **9,615.5** | **104.00 µs** |
+| **CAGRA (25% Bitmask)** | `efSearch = 64`, on-device mask | — | **32,884.8** | **30.41 µs** |
+| **Warp HNSW (25% Bitmask)** | `efSearch = 64`, on-device mask | — | 19,434.5 | 51.45 µs |
+| **Hybrid Dense + CSR Sparse** | `efSearch = 64`, `cand = 64`, GPU RRF | — | 10,655.3 | 93.85 µs |
+
+> **Stage-2 Warp Reranking Advantage**: Moving beyond the single-block `rerank <= 32` path to the fused parallel warp-level Stage-2 reranker (`rerank = 128` / `512`) boosts both throughput (**2.5×–3.5× faster**: `15.71 µs` vs `54.40 µs` on IVF-RaBitQ; `23.59 µs` vs `57.90 µs` on IVF-PQ) and accuracy (**1.0000** / **0.9994** Recall@10), while on-device bitmask filtering skips masked candidates in-kernel so filtered CAGRA sustains **32,884.8 QPS** (**1.69×** filtered HNSW).
+
+### Full SIFT1M Baseline (1,000,000 × 128-D)
 
 Full SIFT1M (1,000,000 × 128-D), scored against the ann-benchmarks ground truth with 1,000 queries and `k = 10`. FlashVector-GPU was built with `m = 32`, `ef_construction = 128`, `nlist = 256`, `m_pq = 16` on CUDA 13.5; the index build takes 570 s. QPS is the best of five repetitions of a single batched dispatch over all 1,000 queries.
 
@@ -265,6 +305,9 @@ python -m pytest python/tests python/tests_adapters -v
 
 # FlashVector Studio Web UI
 cd web && pnpm test && pnpm build
+
+# Reproducible multi-engine GPU benchmark & Pareto chart (`assets/benchmark_pareto.png`)
+python scripts/run_benchmarks.py
 
 # Memory/race/synchronization checks (Linux, full CUDA Toolkit)
 bash scripts/check_sanitizer.sh
