@@ -3,16 +3,19 @@ use rand_distr::{Distribution, Normal};
 use std::sync::Arc;
 use tracing::info;
 
-use crate::projection::PcaProjector3D;
+use crate::batcher::SearchBatcher;
+use crate::projection::{ProjectionMethod, Projector3D};
 use engine::{GpuVectorIndex, IndexConfig, Vector3D};
 
 #[derive(Clone)]
 pub struct AppState {
     pub index: Arc<RwLock<GpuVectorIndex>>,
-    pub projector: Arc<RwLock<Option<PcaProjector3D>>>,
+    pub projector: Arc<RwLock<Option<Projector3D>>>,
+    pub projection_method: Arc<RwLock<ProjectionMethod>>,
     pub projected_points_3d: Arc<RwLock<Vec<Vector3D>>>,
     pub cluster_ids: Arc<RwLock<Vec<u32>>>,
     pub dataset_cache: Arc<RwLock<Vec<f32>>>,
+    pub batcher: Arc<SearchBatcher>,
 }
 
 impl AppState {
@@ -27,19 +30,49 @@ impl AppState {
             metric: 0,
         };
 
-        let index = GpuVectorIndex::new(config).expect("Failed to initialize GpuVectorIndex");
+        let index = Arc::new(RwLock::new(
+            GpuVectorIndex::new(config).expect("Failed to initialize GpuVectorIndex"),
+        ));
+        let batcher = Arc::new(SearchBatcher::for_index(Arc::clone(&index)));
 
         let state = Self {
-            index: Arc::new(RwLock::new(index)),
+            index,
             projector: Arc::new(RwLock::new(None)),
+            projection_method: Arc::new(RwLock::new(ProjectionMethod::Pca)),
             projected_points_3d: Arc::new(RwLock::new(Vec::new())),
             cluster_ids: Arc::new(RwLock::new(Vec::new())),
             dataset_cache: Arc::new(RwLock::new(Vec::new())),
+            batcher,
         };
 
         // Initialize with default high-dimensional clustered dataset (10,000 vectors)
         state.generate_and_index_clustered(10_000, 128, 16);
         state
+    }
+
+    pub fn fit_and_store_projection(
+        &self,
+        vecs: &[f32],
+        dim: usize,
+        method: ProjectionMethod,
+    ) -> usize {
+        let projector = Projector3D::fit(vecs, dim, method);
+        let points_3d = projector.project_batch(vecs);
+        let count = points_3d.len();
+        *self.projector.write() = Some(projector);
+        *self.projection_method.write() = method;
+        *self.projected_points_3d.write() = points_3d;
+        count
+    }
+
+    pub fn rebuild_projection(&self, method: ProjectionMethod) -> usize {
+        let dim = self.index.read().dim();
+        let data = self.dataset_cache.read().clone();
+        if data.is_empty() || dim == 0 {
+            *self.projection_method.write() = method;
+            return 0;
+        }
+        self.fit_and_store_projection(&data, dim, method)
     }
 
     pub fn generate_and_index_clustered(
@@ -74,18 +107,13 @@ impl AppState {
             }
         }
 
-        // Build 3D PCA projection
-        let projector = PcaProjector3D::fit(&data, dim, 2000);
-        let points_3d = projector.project_batch(&data);
-
-        // Build GPU index
+        let method = *self.projection_method.read();
         {
             let mut idx = self.index.write();
             idx.build(&data).expect("Failed to build index on GPU");
         }
 
-        *self.projector.write() = Some(projector);
-        *self.projected_points_3d.write() = points_3d;
+        self.fit_and_store_projection(&data, dim, method);
         *self.cluster_ids.write() = clusters;
         *self.dataset_cache.write() = data;
 

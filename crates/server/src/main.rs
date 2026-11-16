@@ -1,3 +1,5 @@
+#![allow(clippy::needless_range_loop)]
+
 use axum::{
     routing::{get, post},
     Router,
@@ -7,13 +9,14 @@ use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 use tracing::info;
 
+mod batcher;
 mod handlers;
 mod projection;
 mod state;
 
 use handlers::{
-    handle_get_3d_vectors, handle_index, handle_load_snapshot, handle_pq_distortion, handle_search,
-    handle_stats, handle_ws_stream,
+    handle_get_3d_vectors, handle_hybrid_search, handle_index, handle_load_snapshot,
+    handle_pq_distortion, handle_search, handle_set_projection, handle_stats, handle_ws_stream,
 };
 use state::AppState;
 
@@ -42,8 +45,10 @@ async fn main() {
 
     let app = Router::new()
         .route("/api/v1/search", post(handle_search))
+        .route("/api/v1/hybrid_search", post(handle_hybrid_search))
         .route("/api/v1/index", post(handle_index))
         .route("/api/v1/snapshot", post(handle_load_snapshot))
+        .route("/api/v1/projection", post(handle_set_projection))
         .route("/api/v1/pq_distortion", get(handle_pq_distortion))
         .route("/api/v1/stats", get(handle_stats))
         .route("/api/v1/vectors/3d", get(handle_get_3d_vectors))
