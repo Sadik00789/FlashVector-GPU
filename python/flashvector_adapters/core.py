@@ -24,7 +24,7 @@ import threading
 import uuid
 from collections.abc import Hashable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Callable, Optional, Protocol
+from typing import Any, Callable, Optional, Protocol, cast
 
 import numpy as np
 from numpy.typing import NDArray
@@ -136,7 +136,10 @@ def maximal_marginal_relevance(
 
     def _unit(x: NDArray[np.float64]) -> NDArray[np.float64]:
         norms = np.linalg.norm(x, axis=-1, keepdims=True)
-        return x / np.where(norms == 0.0, 1.0, norms)
+        return cast(
+            NDArray[np.float64],
+            np.asarray(x / np.where(norms == 0.0, 1.0, norms), dtype=np.float64),
+        )
 
     unit = _unit(emb)
     sim_q = unit @ _unit(q)

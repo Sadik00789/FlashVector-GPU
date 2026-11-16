@@ -43,17 +43,23 @@ jobs:
     name: CUDA kernels compile (nvcc, no GPU)
     runs-on: ubuntu-latest
     # Advisory: validates the .cu sources build for every target architecture
-    # without needing a GPU. Toolkit installation is occasionally flaky.
+    # without needing a GPU.
     continue-on-error: true
     env:
       FLASHVECTOR_CPU_ONLY: "0"
     steps:
       - uses: actions/checkout@v4
-      - uses: Jimver/cuda-toolkit@v0.2.24
+      - uses: actions/setup-python@v5
         with:
-          cuda: "12.6.3"
-          method: network
-          sub-packages: '["nvcc", "cudart"]'
+          python-version: "3.12"
+      - name: Install CUDA compiler toolchain from PyPI
+        run: |
+          python -m pip install --upgrade pip \
+            nvidia-cuda-nvcc nvidia-cuda-runtime nvidia-cuda-crt nvidia-cuda-cccl nvidia-nvvm
+          CU_ROOT=$(python -c "import nvidia, pathlib; root = pathlib.Path(nvidia.__file__).resolve().parent; print(next(p.parent.parent for p in root.rglob('bin/nvcc')))")
+          echo "CUDA_HOME=$CU_ROOT" >> "$GITHUB_ENV"
+          echo "CUDA_PATH=$CU_ROOT" >> "$GITHUB_ENV"
+          echo "$CU_ROOT/bin" >> "$GITHUB_PATH"
       - name: Build kernel static library
         run: |
           cmake -S kernels -B kernels/build -DCMAKE_BUILD_TYPE=Release \
