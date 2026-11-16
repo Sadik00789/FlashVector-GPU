@@ -1,15 +1,23 @@
 'use client';
 
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import dynamic from 'next/dynamic';
-import { Cpu, Layers, Activity, Search, Play, Pause } from 'lucide-react';
+import { Cpu, Layers, Activity, Search, Play, Pause, SkipBack, SkipForward } from 'lucide-react';
 
 import ControlPanel from '../components/ui/ControlPanel';
 import MetricsPanel from '../components/ui/MetricsPanel';
 import ComparisonPlot from '../components/ui/ComparisonPlot';
+import StepPanel from '../components/ui/StepPanel';
 import { useWebSocket } from '../hooks/useWebSocket';
-import { IndexStats, QueryParams, Vector3D, Vectors3DResponse } from '../lib/types';
+import {
+  IndexStats,
+  ProjectionMethod,
+  QueryParams,
+  Vector3D,
+  Vectors3DResponse,
+} from '../lib/types';
 import { formatLatency } from '../lib/math';
+import { clampStep, scrubLength, stepBackward, stepForward, stepLabel } from '../lib/beam';
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8080';
 
@@ -25,7 +33,12 @@ export default function Dashboard() {
   const [stats, setStats] = useState<IndexStats | null>(null);
   const [isRebuilding, setIsRebuilding] = useState(false);
 
-  const [currentHop, setCurrentHop] = useState(0);
+  const [projection, setProjection] = useState<ProjectionMethod>('pca');
+  const [isProjecting, setIsProjecting] = useState(false);
+  const isProjectingRef = useRef(false);
+
+  // Scrub position: 0 = before the first iteration/probe, N = after the last.
+  const [step, setStep] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
 
   const [queryParams, setQueryParams] = useState<QueryParams>({
@@ -33,11 +46,14 @@ export default function Dashboard() {
     ef_search: 64,
     nprobe: 8,
     use_ivf: false,
+    algorithm: 'hnsw',
+    debug: true,
   });
 
   const { isConnected, latestResponse, latencyHistory, sendQuery } = useWebSocket();
 
-  const hopCount = latestResponse?.hops?.length ?? 0;
+  const length = scrubLength(latestResponse);
+  const currentStep = clampStep(step, length);
 
   // Fetch initial 3D dataset and stats
   const loadData = useCallback(async () => {
@@ -47,10 +63,11 @@ export default function Dashboard() {
         fetch(`${API_BASE}/api/v1/stats`),
       ]);
 
-      if (vecRes.ok) {
+      if (vecRes.ok && !isProjectingRef.current) {
         const vecData: Vectors3DResponse = await vecRes.json();
         setPoints(vecData.points);
         setClusters(vecData.clusters);
+        if (vecData.method) setProjection(vecData.method);
       }
 
       if (statsRes.ok) {
@@ -70,30 +87,87 @@ export default function Dashboard() {
 
   // Restart the replay scrubber whenever a new traversal arrives
   useEffect(() => {
-    setCurrentHop(0);
+    setStep(0);
     setIsPlaying(false);
   }, [latestResponse]);
 
-  // Keep the cursor in range when the traversal length changes
-  useEffect(() => {
-    setCurrentHop((hop) => Math.min(hop, hopCount));
-  }, [hopCount]);
-
-  // Hop-by-hop playback
+  // Step-by-step playback
   useEffect(() => {
     if (!isPlaying) return;
-    if (hopCount === 0 || currentHop >= hopCount) {
+    if (length === 0 || currentStep >= length) {
       setIsPlaying(false);
       return;
     }
     const timer = setTimeout(() => {
-      setCurrentHop((hop) => Math.min(hop + 1, hopCount));
-    }, 180);
+      setStep((s) => stepForward(s, length));
+    }, 350);
     return () => clearTimeout(timer);
-  }, [isPlaying, currentHop, hopCount]);
+  }, [isPlaying, currentStep, length]);
+
+  const handleStepBack = useCallback(() => {
+    setIsPlaying(false);
+    setStep((s) => stepBackward(s, length));
+  }, [length]);
+
+  const handleStepForward = useCallback(() => {
+    setIsPlaying(false);
+    setStep((s) => stepForward(s, length));
+  }, [length]);
+
+  // ArrowLeft / ArrowRight scrub, unless the user is typing/adjusting a control
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+      if (e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
+      const el = e.target as HTMLElement | null;
+      if (
+        el &&
+        (el.tagName === 'INPUT' ||
+          el.tagName === 'TEXTAREA' ||
+          el.tagName === 'SELECT' ||
+          el.isContentEditable)
+      ) {
+        return;
+      }
+      e.preventDefault();
+      if (e.key === 'ArrowLeft') handleStepBack();
+      else handleStepForward();
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [handleStepBack, handleStepForward]);
 
   const handleTriggerSearch = () => {
-    sendQuery(queryParams);
+    sendQuery({ ...queryParams, debug: true });
+  };
+
+  const handleChangeProjection = async (method: ProjectionMethod) => {
+    if (isProjectingRef.current || method === projection) return;
+    isProjectingRef.current = true;
+    setIsProjecting(true);
+    try {
+      const res = await fetch(`${API_BASE}/api/v1/projection`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ method }),
+      });
+      if (res.ok) {
+        isProjectingRef.current = false;
+        setProjection(method);
+        const vecRes = await fetch(`${API_BASE}/api/v1/vectors/3d`);
+        if (vecRes.ok) {
+          const vecData: Vectors3DResponse = await vecRes.json();
+          setPoints(vecData.points);
+          setClusters(vecData.clusters);
+          setProjection(vecData.method ?? method);
+        }
+      }
+    } catch {
+      // Backend offline; keep the current projection
+    } finally {
+      isProjectingRef.current = false;
+      setIsProjecting(false);
+    }
   };
 
   const handleRebuildDataset = async (numVectors: number) => {
@@ -156,6 +230,9 @@ export default function Dashboard() {
             onRebuildDataset={handleRebuildDataset}
             isRebuilding={isRebuilding}
             isConnected={isConnected}
+            projection={projection}
+            isProjecting={isProjecting}
+            onChangeProjection={handleChangeProjection}
           />
           <ComparisonPlot />
         </div>
@@ -165,41 +242,65 @@ export default function Dashboard() {
           <EmbeddingSpace
             points={points}
             clusters={clusters}
-            hops={latestResponse?.hops ?? []}
-            results={latestResponse?.results ?? []}
-            currentHop={currentHop}
+            response={latestResponse}
+            step={currentStep}
           />
+
+          {isProjecting && (
+            <div className="absolute top-4 left-1/2 -translate-x-1/2 z-20 glass-panel px-4 py-2 rounded-xl text-xs font-mono text-slate-200 flex items-center gap-2">
+              <span className="w-2 h-2 rounded-full bg-accent animate-pulse" />
+              Computing projection...
+            </div>
+          )}
 
           {/* Traversal Replay Scrubber */}
           <div className="absolute bottom-6 left-1/2 -translate-x-1/2 z-20">
-            <div className="glass-panel-glow px-6 py-3 rounded-2xl flex items-center gap-4">
+            <div className="glass-panel-glow px-6 py-3 rounded-2xl flex items-center gap-3">
+              <button
+                onClick={handleStepBack}
+                disabled={length === 0 || currentStep <= 0}
+                aria-label="Step back"
+                title="Step back (Left arrow)"
+                className="flex items-center px-2 py-1.5 rounded-lg bg-white/5 text-slate-200 hover:bg-white/10 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+              >
+                <SkipBack className="w-3.5 h-3.5" />
+              </button>
               <button
                 onClick={() => {
-                  if (!isPlaying && currentHop >= hopCount) {
-                    setCurrentHop(0);
+                  if (!isPlaying && currentStep >= length) {
+                    setStep(0);
                   }
                   setIsPlaying((playing) => !playing);
                 }}
-                disabled={hopCount === 0}
+                disabled={length === 0}
                 className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-primary/20 text-primary hover:bg-primary/30 text-xs font-mono font-semibold disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
               >
                 {isPlaying ? <Pause className="w-3.5 h-3.5" /> : <Play className="w-3.5 h-3.5" />}
                 {isPlaying ? 'Pause' : 'Play'}
               </button>
+              <button
+                onClick={handleStepForward}
+                disabled={length === 0 || currentStep >= length}
+                aria-label="Step forward"
+                title="Step forward (Right arrow)"
+                className="flex items-center px-2 py-1.5 rounded-lg bg-white/5 text-slate-200 hover:bg-white/10 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+              >
+                <SkipForward className="w-3.5 h-3.5" />
+              </button>
               <input
                 type="range"
                 min={0}
-                max={hopCount}
-                value={currentHop}
-                disabled={hopCount === 0}
+                max={length}
+                value={currentStep}
+                disabled={length === 0}
                 onChange={(e) => {
                   setIsPlaying(false);
-                  setCurrentHop(parseInt(e.target.value, 10));
+                  setStep(clampStep(parseInt(e.target.value, 10), length));
                 }}
-                className="w-64 accent-primary disabled:opacity-40"
+                className="w-56 accent-primary disabled:opacity-40"
               />
-              <span className="font-mono text-xs text-primary whitespace-nowrap">
-                Hop {currentHop} / {hopCount}
+              <span className="font-mono text-xs text-primary whitespace-nowrap min-w-[10rem]">
+                {stepLabel(latestResponse, currentStep)}
               </span>
               <span className="font-mono text-xs text-slate-400 whitespace-nowrap">
                 {formatLatency(latestResponse?.latency_us ?? 0)}
@@ -215,6 +316,8 @@ export default function Dashboard() {
             latestResponse={latestResponse}
             latencyHistory={latencyHistory}
           />
+
+          <StepPanel response={latestResponse} step={currentStep} />
 
           {/* Nearest Neighbor Results Table */}
           <div className="glass-panel p-4 rounded-2xl flex flex-col gap-3 text-sm">

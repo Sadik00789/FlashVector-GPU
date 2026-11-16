@@ -1,8 +1,17 @@
 'use client';
 
 import React from 'react';
-import { Play, RefreshCw, Cpu, Layers, Zap, Database } from 'lucide-react';
-import { QueryParams } from '../../lib/types';
+import { Play, RefreshCw, Layers, Zap, Database, Compass } from 'lucide-react';
+import { Algorithm, ProjectionMethod, QueryParams } from '../../lib/types';
+import { isIvfAlgorithm } from '../../lib/beam';
+
+const ALGORITHMS: { value: Algorithm; label: string }[] = [
+  { value: 'hnsw', label: 'HNSW Warp Beam' },
+  { value: 'cagra', label: 'CAGRA flat graph' },
+  { value: 'ivf_pq', label: 'IVF-PQ ADC' },
+  { value: 'ivf_sq8', label: 'IVF-SQ8' },
+  { value: 'ivf_rabitq', label: 'IVF-RaBitQ' },
+];
 
 interface ControlPanelProps {
   params: QueryParams;
@@ -11,6 +20,9 @@ interface ControlPanelProps {
   onRebuildDataset: (numVectors: number) => void;
   isRebuilding: boolean;
   isConnected: boolean;
+  projection: ProjectionMethod;
+  isProjecting: boolean;
+  onChangeProjection: (method: ProjectionMethod) => void;
 }
 
 export default function ControlPanel({
@@ -20,7 +32,14 @@ export default function ControlPanel({
   onRebuildDataset,
   isRebuilding,
   isConnected,
+  projection,
+  isProjecting,
+  onChangeProjection,
 }: ControlPanelProps) {
+  const algorithm: Algorithm = params.algorithm ?? (params.use_ivf ? 'ivf_pq' : 'hnsw');
+  const handleAlgorithm = (next: Algorithm) =>
+    onChangeParams({ ...params, algorithm: next, use_ivf: isIvfAlgorithm(next) });
+
   return (
     <div className="glass-panel p-5 rounded-2xl flex flex-col gap-5 text-sm">
       {/* Header */}
@@ -46,35 +65,55 @@ export default function ControlPanel({
         </div>
       </div>
 
-      {/* Algorithm Mode Switcher */}
+      {/* Algorithm Selector */}
       <div className="flex flex-col gap-2">
-        <label className="text-xs font-mono text-slate-400 flex items-center gap-1.5">
+        <label
+          htmlFor="algorithm-select"
+          className="text-xs font-mono text-slate-400 flex items-center gap-1.5"
+        >
           <Layers className="w-3.5 h-3.5 text-primary" /> ALGORITHM ENGINE
         </label>
-        <div className="grid grid-cols-2 gap-2 p-1 bg-black/40 rounded-xl border border-white/5">
-          <button
-            onClick={() => onChangeParams({ ...params, use_ivf: false })}
-            className={`py-2 px-3 rounded-lg text-xs font-medium transition-all ${
-              !params.use_ivf
-                ? 'bg-primary/20 text-primary border border-primary/40 shadow-glow'
-                : 'text-slate-400 hover:text-white'
-            }`}
-          >
-            HNSW Warp Beam
-          </button>
-          <button
-            onClick={() => onChangeParams({ ...params, use_ivf: true })}
-            className={`py-2 px-3 rounded-lg text-xs font-medium transition-all ${
-              params.use_ivf
-                ? 'bg-secondary/30 text-purple-300 border border-secondary/50'
-                : 'text-slate-400 hover:text-white'
-            }`}
-          >
-            IVF-PQ ADC (Shared)
-          </button>
-        </div>
+        <select
+          id="algorithm-select"
+          value={algorithm}
+          onChange={(e) => handleAlgorithm(e.target.value as Algorithm)}
+          className="w-full py-2 px-3 rounded-xl bg-black/40 border border-white/10 text-xs font-mono text-slate-200 focus:outline-none focus:border-primary/60 cursor-pointer"
+        >
+          {ALGORITHMS.map((a) => (
+            <option key={a.value} value={a.value} className="bg-[#0d0f16]">
+              {a.label}
+            </option>
+          ))}
+        </select>
       </div>
 
+      {/* Projection Toggle */}
+      <div className="flex flex-col gap-2">
+        <label className="text-xs font-mono text-slate-400 flex items-center gap-1.5">
+          <Compass className="w-3.5 h-3.5 text-accent" /> 3D PROJECTION
+          {isProjecting && <RefreshCw className="w-3 h-3 animate-spin text-accent" />}
+        </label>
+        <div className="grid grid-cols-2 gap-2 p-1 bg-black/40 rounded-xl border border-white/5">
+          {(['pca', 'umap'] as ProjectionMethod[]).map((m) => (
+            <button
+              key={m}
+              onClick={() => onChangeProjection(m)}
+              disabled={isProjecting}
+              aria-pressed={projection === m}
+              className={`py-2 px-3 rounded-lg text-xs font-medium transition-all disabled:cursor-wait ${
+                projection === m
+                  ? 'bg-primary/20 text-primary border border-primary/40 shadow-glow'
+                  : 'text-slate-400 hover:text-white'
+              }`}
+            >
+              {m === 'pca' ? 'PCA' : 'UMAP'}
+            </button>
+          ))}
+        </div>
+        {isProjecting && (
+          <p className="text-[11px] font-mono text-slate-500">Computing projection...</p>
+        )}
+      </div>
       {/* Sliders */}
       <div className="flex flex-col gap-4">
         {/* Top-K */}
@@ -94,7 +133,7 @@ export default function ControlPanel({
         </div>
 
         {/* efSearch (for HNSW) */}
-        {!params.use_ivf && (
+        {!isIvfAlgorithm(algorithm) && (
           <div className="flex flex-col gap-1.5">
             <div className="flex justify-between text-xs">
               <span className="text-slate-300 font-mono">efSearch (Beam Width)</span>
@@ -113,7 +152,7 @@ export default function ControlPanel({
         )}
 
         {/* nprobe (for IVF-PQ) */}
-        {params.use_ivf && (
+        {isIvfAlgorithm(algorithm) && (
           <div className="flex flex-col gap-1.5">
             <div className="flex justify-between text-xs">
               <span className="text-slate-300 font-mono">nprobe (Centroids Scanned)</span>

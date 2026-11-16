@@ -5,7 +5,7 @@ import { Canvas } from '@react-three/fiber';
 import { OrbitControls, Stars } from '@react-three/drei';
 import * as THREE from 'three';
 
-import { GpuSearchResult, TraversalHop3D, Vector3D } from '../../lib/types';
+import { SearchResponse, Vector3D } from '../../lib/types';
 import { getClusterColor } from '../../lib/math';
 import CentroidNodes from './CentroidNodes';
 import TraversalBeam from './TraversalBeam';
@@ -13,9 +13,8 @@ import TraversalBeam from './TraversalBeam';
 interface EmbeddingSpaceProps {
   points: Vector3D[];
   clusters: number[];
-  hops: TraversalHop3D[];
-  results: GpuSearchResult[];
-  currentHop: number;
+  response: SearchResponse | null;
+  step: number;
 }
 
 function VectorPointCloud({ points, clusters }: { points: Vector3D[]; clusters: number[] }) {
@@ -62,9 +61,8 @@ function VectorPointCloud({ points, clusters }: { points: Vector3D[]; clusters: 
 export default function EmbeddingSpace({
   points,
   clusters,
-  hops,
-  results,
-  currentHop,
+  response,
+  step,
 }: EmbeddingSpaceProps) {
   return (
     <div className="w-full h-full relative">
@@ -90,10 +88,9 @@ export default function EmbeddingSpace({
 
         {/* Traversal Beam Routing & Top-K Targets */}
         <TraversalBeam
-          hops={hops}
-          results={results}
+          response={response}
           points={points}
-          currentHop={currentHop}
+          step={step}
         />
 
         <OrbitControls

@@ -38,11 +38,47 @@ export interface IndexStats {
   stats: LatencyStats;
 }
 
+export type Algorithm = 'hnsw' | 'cagra' | 'ivf_pq' | 'ivf_sq8' | 'ivf_rabitq';
+
+export type ProjectionMethod = 'pca' | 'umap';
+
+export interface BeamCandidate {
+  id: number;
+  distance: number;
+  visited: boolean;
+  pos: Vector3D | null;
+}
+
+export interface BeamStep {
+  iteration: number;
+  expanded_node: number;
+  expanded_distance: number;
+  /** Index into hops of the first distance evaluation made in this iteration. */
+  eval_start: number;
+  eval_count: number;
+  expanded_pos: Vector3D | null;
+  /** Sorted candidate queue (best first) AFTER this iteration. */
+  candidates: BeamCandidate[];
+}
+
+export interface ProbeStep {
+  rank: number;
+  cluster_id: number;
+  centroid_distance: number;
+  list_len: number;
+  best_distance: number | null;
+  result_ids: number[];
+  centroid_pos: Vector3D | null;
+}
+
 export interface SearchResponse {
   results: GpuSearchResult[];
   hops: TraversalHop3D[];
   latency_us: number;
   stats: LatencyStats;
+  beam_steps?: BeamStep[];
+  probes?: ProbeStep[];
+  algorithm?: string;
 }
 
 export interface QueryParams {
@@ -50,11 +86,20 @@ export interface QueryParams {
   ef_search: number;
   nprobe: number;
   use_ivf: boolean;
+  algorithm?: Algorithm;
+  debug?: boolean;
 }
 
 export interface Vectors3DResponse {
   points: Vector3D[];
   clusters: number[];
+  count: number;
+  method?: ProjectionMethod;
+}
+
+export interface ProjectionResponse {
+  status: string;
+  method: ProjectionMethod;
   count: number;
 }
 

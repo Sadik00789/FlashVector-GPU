@@ -1,6 +1,7 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
-  output: 'standalone',
+  // Standalone output symlinks pnpm packages, which requires elevated privileges on Windows.
+  ...(process.platform === 'win32' ? {} : { output: 'standalone' }),
   reactStrictMode: true,
   transpilePackages: ['three', '@react-three/fiber', '@react-three/drei'],
   async rewrites() {
