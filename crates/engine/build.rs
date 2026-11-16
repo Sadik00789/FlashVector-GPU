@@ -82,8 +82,36 @@ fn command_available(name: &str, version_flag: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether the build was asked to skip CUDA entirely (`FLASHVECTOR_CPU_ONLY=1`).
+fn cpu_only_requested() -> bool {
+    std::env::var("FLASHVECTOR_CPU_ONLY")
+        .map(|value| !matches!(value.trim(), "" | "0" | "false" | "FALSE" | "no"))
+        .unwrap_or(false)
+}
+
+/// Link a host-memory stand-in for the CUDA bridge so the workspace can be
+/// checked, linted and unit-tested without a toolkit or GPU (CPU-only CI).
+fn build_cpu_stub(manifest_dir: &Path) {
+    let stub = manifest_dir.join("cpu_stub").join("cpu_stub.c");
+    cc::Build::new()
+        .file(&stub)
+        .warnings(true)
+        .compile("flashvector_cpu_stub");
+    println!("cargo:rustc-cfg=flashvector_cpu_only");
+    println!("cargo:rerun-if-changed={}", stub.display());
+}
+
 fn main() {
+    println!("cargo:rustc-check-cfg=cfg(flashvector_cpu_only)");
+    println!("cargo:rerun-if-env-changed=FLASHVECTOR_CPU_ONLY");
+
     let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
+
+    if cpu_only_requested() {
+        build_cpu_stub(&manifest_dir);
+        return;
+    }
+
     let repo_root = manifest_dir.parent().unwrap().parent().unwrap();
     let kernels_dir = repo_root.join("kernels");
     let kernels_build_dir = kernels_dir.join("build");
